@@ -90,6 +90,10 @@ import { CreatorEventsModule } from './creator-events/creator-events.module';
     CommonModule,
     FlagsModule,
     DisputesModule,
+    MatchesModule,
+    IndexerModule,
+    ContractModule,
+    CreatorEventsModule,
 
   ],
 
