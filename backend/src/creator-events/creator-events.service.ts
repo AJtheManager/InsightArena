@@ -149,9 +149,6 @@ export class CreatorEventsService {
     return config;
   }
 
-  /**
-   * #728 — Get all matches for an event with filtering and sorting
-   */
   async getEventMatches(
     eventId: string,
     query: ListMatchesQueryDto,
@@ -165,7 +162,6 @@ export class CreatorEventsService {
 
     let matches = await this.contractService.getEventMatches(eventId);
 
-    // Filter by status
     if (query.status !== MatchStatus.All) {
       matches = matches.filter((m) => {
         if (query.status === MatchStatus.Pending) {
@@ -178,19 +174,14 @@ export class CreatorEventsService {
       });
     }
 
-    // Sort matches
     matches = this.sortMatches(matches, query.sortBy, query.sortOrder);
 
-    // Add prediction count (would come from contract or DB in real implementation)
     return matches.map((m) => ({
       ...m,
-      predictionCount: 0, // Placeholder - would be fetched from contract
+      predictionCount: 0,
     }));
   }
 
-  /**
-   * #725 — Get event by invite code
-   */
   async getEventByInviteCode(code: string): Promise<EventByCodeResponseDto> {
     const event = await this.contractService.getEventByCode(code);
 
@@ -203,7 +194,6 @@ export class CreatorEventsService {
       this.contractService.getEventWinners(event.eventId),
     ]);
 
-    // Determine status
     let status: 'active' | 'full' | 'cancelled' = 'active';
     if (!event.isActive) {
       status = 'cancelled';
@@ -233,9 +223,6 @@ export class CreatorEventsService {
     };
   }
 
-  /**
-   * #733 — Get user score for an event
-   */
   async getUserScore(
     eventId: string,
     address: string,
@@ -251,13 +238,11 @@ export class CreatorEventsService {
       this.contractService.getEventParticipants(eventId),
     ]);
 
-    // Find user's rank
     const userParticipant = participants.find((p) => p.address === address);
     const rank = userParticipant
       ? participants.findIndex((p) => p.address === address) + 1
       : participants.length + 1;
 
-    // Calculate predictions stats
     let correctPredictions = 0;
     let incorrectPredictions = 0;
     let pendingPredictions = 0;
@@ -312,7 +297,6 @@ export class CreatorEventsService {
         case MatchSortBy.MatchTime:
           return (a.startTime - b.startTime) * dir;
         case MatchSortBy.CreatedAt:
-          // Assuming matches don't have createdAt, use startTime as fallback
           return (a.startTime - b.startTime) * dir;
         default:
           return 0;
