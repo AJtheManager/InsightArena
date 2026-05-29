@@ -20,13 +20,16 @@ fn setup() -> (
     let contract_id =
         env.register_contract(None, creator_event_manager::CreatorEventManagerContract);
     let client = CreatorEventManagerContractClient::new(&env, &contract_id);
-    let client: CreatorEventManagerContractClient<'static> = unsafe { core::mem::transmute(client) };
+    let client: CreatorEventManagerContractClient<'static> =
+        unsafe { core::mem::transmute(client) };
 
     let admin = Address::generate(&env);
     let ai_agent = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let xlm_token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let xlm_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
 
     client.initialize(&admin, &ai_agent, &treasury, &xlm_token, &FEE);
     (env, client, contract_id, admin, xlm_token)

@@ -3,6 +3,7 @@
 pub mod admin;
 mod event;
 mod invite;
+mod oracle;
 pub mod r#match;
 pub mod prediction;
 pub mod storage;
@@ -15,7 +16,7 @@ use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec};
 
 use admin::AdminError;
 use event::EventError;
-use storage_types::{Event, Prediction};
+use storage_types::{Event, Prediction, Winner};
 use verification::VerificationError;
 use views::EventStatistics;
 
@@ -385,5 +386,63 @@ impl CreatorEventManagerContract {
     /// are always present; outcomes with no predictions return `0`.
     pub fn get_prediction_distribution(env: Env, match_id: u64) -> (u32, u32, u32) {
         prediction::get_prediction_distribution(&env, match_id)
+    }
+
+    // =========================================================================
+    // Oracle / Winner Verification (#798–#801)
+    // =========================================================================
+
+    /// Verify and record all perfect scorers for an event.
+    ///
+    /// After all matches in an event are resolved, calculate which users
+    /// predicted all matches correctly and store them as winners.
+    ///
+    /// # Panics
+    /// * `"contract_paused"` — contract is paused.
+    /// * `"event_not_found"` — no event exists with the given ID.
+    /// * `"event_cancelled"` — event has been cancelled.
+    /// * `"matches_not_complete"` — not all matches have been resolved.
+    pub fn verify_event_winners(env: Env, caller: Address, event_id: u64) -> u32 {
+        match oracle::verify_event_winners(&env, caller, event_id) {
+            Ok(count) => count,
+            Err(oracle::OracleError::Paused) => panic!("contract_paused"),
+            Err(oracle::OracleError::EventNotFound) => panic!("event_not_found"),
+            Err(oracle::OracleError::EventCancelled) => panic!("event_cancelled"),
+            Err(oracle::OracleError::MatchesNotComplete) => panic!("matches_not_complete"),
+            Err(oracle::OracleError::Overflow) => panic!("overflow"),
+            Err(_) => panic!("unexpected_error"),
+        }
+    }
+
+    /// Retrieve the list of winners for an event.
+    ///
+    /// Public view function to retrieve the list of winners for an event.
+    /// Used for leaderboards and rewards.
+    ///
+    /// # Panics
+    /// * `"event_not_found"` — no event exists with the given ID.
+    pub fn get_event_winners(env: Env, event_id: u64) -> Vec<Winner> {
+        match oracle::get_event_winners(&env, event_id) {
+            Ok(winners) => winners,
+            Err(oracle::OracleError::EventNotFound) => panic!("event_not_found"),
+            Err(_) => panic!("unexpected_error"),
+        }
+    }
+
+    /// Calculate a user's score (correct predictions) for an event.
+    ///
+    /// Useful for partial scoring and leaderboards.
+    ///
+    /// Returns a tuple `(correct_count, total_matches)`.
+    ///
+    /// # Panics
+    /// * `"event_not_found"` — no event exists with the given ID.
+    pub fn get_user_score(env: Env, user: Address, event_id: u64) -> (u32, u32) {
+        match oracle::get_user_score(&env, user, event_id) {
+            Ok(score) => score,
+            Err(oracle::OracleError::EventNotFound) => panic!("event_not_found"),
+            Err(oracle::OracleError::Overflow) => panic!("overflow"),
+            Err(_) => panic!("unexpected_error"),
+        }
     }
 }

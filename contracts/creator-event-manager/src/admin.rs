@@ -189,11 +189,7 @@ pub fn initialize(
 /// # Events
 /// Emits `(Symbol("admin"), Symbol("treasury_updated"))` with data
 /// `(old_treasury, new_treasury)`.
-pub fn set_treasury(
-    env: &Env,
-    caller: Address,
-    new_treasury: Address,
-) -> Result<(), AdminError> {
+pub fn set_treasury(env: &Env, caller: Address, new_treasury: Address) -> Result<(), AdminError> {
     require_is_admin(env, &caller)?;
 
     if new_treasury == env.current_contract_address() {
@@ -247,11 +243,7 @@ pub fn set_treasury(
 /// # Events
 /// Emits `(Symbol("admin"), Symbol("ai_agent_updated"))` with data
 /// `(old_agent, new_agent)`.
-pub fn set_ai_agent(
-    env: &Env,
-    caller: Address,
-    new_agent: Address,
-) -> Result<(), AdminError> {
+pub fn set_ai_agent(env: &Env, caller: Address, new_agent: Address) -> Result<(), AdminError> {
     require_is_admin(env, &caller)?;
 
     if new_agent == env.current_contract_address() {

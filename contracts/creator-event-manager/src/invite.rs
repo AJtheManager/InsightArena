@@ -64,4 +64,3 @@ pub fn generate_invite_code(env: &Env) -> Result<Symbol, InviteError> {
 
     Err(InviteError::CodeGenerationFailed)
 }
-

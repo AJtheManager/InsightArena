@@ -52,8 +52,7 @@ fn test_create_event_success() {
     let creator = Address::generate(&env);
     fund(&env, &xlm_token, &creator, FEE);
 
-    let (event_id, _invite_code) =
-        client.create_event(&creator, &title(&env), &desc(&env), &5u32);
+    let (event_id, _invite_code) = client.create_event(&creator, &title(&env), &desc(&env), &5u32);
     assert_eq!(event_id, 1);
 }
 
@@ -63,8 +62,7 @@ fn test_create_event_stores_correct_fields() {
     let creator = Address::generate(&env);
     fund(&env, &xlm_token, &creator, FEE);
 
-    let (event_id, invite_code) =
-        client.create_event(&creator, &title(&env), &desc(&env), &10u32);
+    let (event_id, invite_code) = client.create_event(&creator, &title(&env), &desc(&env), &10u32);
 
     let event = client.get_event(&event_id);
     assert_eq!(event.event_id, event_id);
@@ -159,8 +157,7 @@ fn test_get_event_by_code_returns_correct_event() {
     let creator = Address::generate(&env);
     fund(&env, &xlm_token, &creator, FEE);
 
-    let (event_id, invite_code) =
-        client.create_event(&creator, &title(&env), &desc(&env), &5u32);
+    let (event_id, invite_code) = client.create_event(&creator, &title(&env), &desc(&env), &5u32);
     let event = client.get_event_by_code(&invite_code);
     assert_eq!(event.event_id, event_id);
 }

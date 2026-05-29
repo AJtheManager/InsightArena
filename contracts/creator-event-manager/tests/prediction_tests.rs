@@ -21,13 +21,16 @@ fn setup() -> (
     let contract_id =
         env.register_contract(None, creator_event_manager::CreatorEventManagerContract);
     let client = CreatorEventManagerContractClient::new(&env, &contract_id);
-    let client: CreatorEventManagerContractClient<'static> = unsafe { core::mem::transmute(client) };
+    let client: CreatorEventManagerContractClient<'static> =
+        unsafe { core::mem::transmute(client) };
 
     let admin = Address::generate(&env);
     let ai_agent = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let xlm_token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let xlm_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
 
     client.initialize(&admin, &ai_agent, &treasury, &xlm_token, &FEE);
     (env, client, contract_id, admin, xlm_token)
@@ -56,7 +59,8 @@ fn create_event_and_match(
 ) -> (u64, Symbol, u64) {
     fund(env, xlm_token, creator, FEE);
 
-    let (event_id, invite_code) = client.create_event(creator, &title(env), &desc(env), &max_participants);
+    let (event_id, invite_code) =
+        client.create_event(creator, &title(env), &desc(env), &max_participants);
 
     let match_id = env.as_contract(contract_id, || {
         let match_id = storage::next_match_id(env);
@@ -84,13 +88,16 @@ fn test_join_event_valid_code_succeeds() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let user = Address::generate(&env);
-    let (event_id, invite_code, _) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (event_id, invite_code, _) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&user, &invite_code);
 
     let event = client.get_event(&event_id);
     assert_eq!(event.participant_count, 1);
-    let participants = env.as_contract(&contract_id, || storage::get_event_participants(&env, event_id));
+    let participants = env.as_contract(&contract_id, || {
+        storage::get_event_participants(&env, event_id)
+    });
     assert_eq!(participants.len(), 1);
 }
 
@@ -109,7 +116,8 @@ fn test_join_event_already_joined_rejected() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let user = Address::generate(&env);
-    let (_event_id, invite_code, _) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (_event_id, invite_code, _) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&user, &invite_code);
     client.join_event(&user, &invite_code);
@@ -122,7 +130,8 @@ fn test_join_event_full_event_blocks_joining() {
     let creator = Address::generate(&env);
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
-    let (_event_id, invite_code, _) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 1, 10_000);
+    let (_event_id, invite_code, _) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 1, 10_000);
 
     client.join_event(&user1, &invite_code);
     client.join_event(&user2, &invite_code);
@@ -134,7 +143,8 @@ fn test_join_event_cancelled_event_blocks_joining() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let user = Address::generate(&env);
-    let (event_id, invite_code, _) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (event_id, invite_code, _) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     env.as_contract(&contract_id, || {
         let mut event = storage::get_event(&env, event_id).expect("event exists");
@@ -150,7 +160,8 @@ fn test_join_event_increments_participant_count() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let user = Address::generate(&env);
-    let (event_id, invite_code, _) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (event_id, invite_code, _) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&user, &invite_code);
 
@@ -163,15 +174,13 @@ fn test_submit_prediction_valid_succeeds() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (_event_id, invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (_event_id, invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&predictor, &invite_code);
 
-    let prediction_id = client.submit_prediction(
-        &predictor,
-        &match_id,
-        &Symbol::new(&env, "TEAM_A"),
-    );
+    let prediction_id =
+        client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "TEAM_A"));
 
     assert_eq!(prediction_id, 1);
 
@@ -188,7 +197,8 @@ fn test_submit_prediction_non_participant_rejected() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (_event_id, _invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (_event_id, _invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "TEAM_A"));
 }
@@ -199,7 +209,8 @@ fn test_submit_prediction_late_prediction_rejected() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (_event_id, invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 1);
+    let (_event_id, invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 1);
 
     client.join_event(&predictor, &invite_code);
     env.ledger().with_mut(|ledger| ledger.timestamp += 10);
@@ -213,7 +224,8 @@ fn test_submit_prediction_invalid_outcome_rejected() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (_event_id, invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (_event_id, invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&predictor, &invite_code);
     client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "INVALID"));
@@ -225,7 +237,8 @@ fn test_submit_prediction_duplicate_rejected() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (_event_id, invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (_event_id, invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&predictor, &invite_code);
     client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "TEAM_A"));
@@ -238,7 +251,8 @@ fn test_submit_prediction_cancelled_event_blocks_prediction() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (event_id, invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (event_id, invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&predictor, &invite_code);
 
@@ -256,10 +270,12 @@ fn test_get_prediction_returns_existing_prediction() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (_event_id, invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (_event_id, invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&predictor, &invite_code);
-    let prediction_id = client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "TEAM_A"));
+    let prediction_id =
+        client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "TEAM_A"));
 
     let prediction = client.get_prediction(&prediction_id);
     assert_eq!(prediction.prediction_id, prediction_id);
@@ -278,10 +294,12 @@ fn test_get_prediction_extends_ttl() {
     let (env, client, contract_id, _admin, xlm_token) = setup();
     let creator = Address::generate(&env);
     let predictor = Address::generate(&env);
-    let (_event_id, invite_code, match_id) = create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
+    let (_event_id, invite_code, match_id) =
+        create_event_and_match(&env, &contract_id, &client, &creator, &xlm_token, 2, 10_000);
 
     client.join_event(&predictor, &invite_code);
-    let prediction_id = client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "TEAM_A"));
+    let prediction_id =
+        client.submit_prediction(&predictor, &match_id, &Symbol::new(&env, "TEAM_A"));
 
     let current_ledger = env.ledger().get().sequence_number;
     env.ledger().set_sequence_number(current_ledger + 1);

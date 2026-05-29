@@ -39,7 +39,10 @@ fn emit_prediction_submitted(
     predicted_outcome: &Symbol,
 ) {
     env.events().publish(
-        (Symbol::new(env, "prediction"), Symbol::new(env, "submitted")),
+        (
+            Symbol::new(env, "prediction"),
+            Symbol::new(env, "submitted"),
+        ),
         (
             prediction_id,
             match_id,
@@ -90,7 +93,8 @@ pub fn join_event(env: &Env, user: Address, invite_code: Symbol) -> Result<(), P
         .get(&invite_key)
         .ok_or(PredictionError::InvalidInviteCode)?;
 
-    let mut event: Event = storage::get_event(env, event_id).map_err(|_| PredictionError::EventNotFound)?;
+    let mut event: Event =
+        storage::get_event(env, event_id).map_err(|_| PredictionError::EventNotFound)?;
 
     if !event.is_active || event.is_cancelled {
         return Err(PredictionError::EventCancelled);
@@ -130,7 +134,8 @@ pub fn submit_prediction(
         return Err(PredictionError::Paused);
     }
 
-    let match_record: Match = storage::get_match(env, match_id).map_err(|_| PredictionError::MatchNotFound)?;
+    let match_record: Match =
+        storage::get_match(env, match_id).map_err(|_| PredictionError::MatchNotFound)?;
     let event: Event = storage::get_event(env, match_record.event_id)
         .map_err(|_| PredictionError::EventNotFound)?;
 
@@ -139,7 +144,10 @@ pub fn submit_prediction(
     }
 
     let participants = storage::get_event_participants(env, event.event_id);
-    if !participants.iter().any(|participant| participant == predictor) {
+    if !participants
+        .iter()
+        .any(|participant| participant == predictor)
+    {
         return Err(PredictionError::NotJoined);
     }
 
@@ -199,11 +207,7 @@ pub fn get_prediction(env: &Env, prediction_id: u64) -> Result<Prediction, Predi
 /// monotonically non-decreasing, the list is almost always already sorted;
 /// the explicit sort guarantees correctness even if two predictions share the
 /// same timestamp.
-pub fn get_user_predictions(
-    env: &Env,
-    user: Address,
-    event_id: u64,
-) -> Vec<Prediction> {
+pub fn get_user_predictions(env: &Env, user: Address, event_id: u64) -> Vec<Prediction> {
     let prediction_ids = storage::get_user_predictions(env, &user, event_id);
 
     let mut predictions: Vec<Prediction> = Vec::new(env);
@@ -242,10 +246,7 @@ pub fn get_user_predictions(
 ///
 /// # Return format
 /// `(team_a_count: u32, team_b_count: u32, draw_count: u32)`
-pub fn get_prediction_distribution(
-    env: &Env,
-    match_id: u64,
-) -> (u32, u32, u32) {
+pub fn get_prediction_distribution(env: &Env, match_id: u64) -> (u32, u32, u32) {
     let prediction_ids = storage::get_match_predictions(env, match_id);
 
     let team_a_sym = Symbol::new(env, crate::storage_types::OUTCOME_TEAM_A);
