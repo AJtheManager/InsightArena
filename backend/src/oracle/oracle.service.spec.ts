@@ -91,6 +91,7 @@ describe('OracleService', () => {
     }).compile();
 
     service = module.get<OracleService>(OracleService);
+    eventRepo.find.mockResolvedValue([mockEvent]);
   });
 
   describe('getPendingMatches', () => {

@@ -41,7 +41,9 @@ export class OracleService {
     const eventIds = [...new Set(matches.map((m) => m.event_id))];
     const events =
       eventIds.length > 0
-        ? await this.eventRepository.find({ where: { id: In(eventIds) } })
+        ? ((await this.eventRepository.find({
+            where: { id: In(eventIds) },
+          })) ?? [])
         : [];
     const eventMap = new Map(events.map((e) => [e.id, e]));
 
