@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { EventsGateway } from './events.gateway';
 
 export interface NotificationPayload {
@@ -28,15 +28,22 @@ export interface EventWinnerPayload {
 }
 
 @Injectable()
-export class NotificationBroadcasterService {
+export class NotificationBroadcasterService implements OnModuleDestroy {
   private readonly logger = new Logger(NotificationBroadcasterService.name);
   private readonly batchQueue = new Map<string, NotificationPayload[]>();
   private readonly batchInterval = 1000; // 1 second
   private readonly maxBatchSize = 10;
   private deliveryConfirmations = new Map<string, Set<number>>();
+  private batchProcessorInterval?: NodeJS.Timeout;
 
   constructor(private readonly gateway: EventsGateway) {
     this.startBatchProcessor();
+  }
+
+  onModuleDestroy(): void {
+    if (this.batchProcessorInterval) {
+      clearInterval(this.batchProcessorInterval);
+    }
   }
 
   /**
@@ -205,7 +212,7 @@ export class NotificationBroadcasterService {
    * Process batches periodically
    */
   private startBatchProcessor(): void {
-    setInterval(() => {
+    this.batchProcessorInterval = setInterval(() => {
       for (const key of this.batchQueue.keys()) {
         const [userAddress, eventType] = key.split(':');
         this.flushBatch(userAddress, eventType);

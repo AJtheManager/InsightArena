@@ -8,6 +8,8 @@ describe('NotificationBroadcasterService', () => {
   let mockServer: any;
 
   beforeEach(async () => {
+    jest.useFakeTimers();
+    
     mockServer = {
       to: jest.fn().mockReturnThis(),
       emit: jest.fn(),
@@ -33,6 +35,12 @@ describe('NotificationBroadcasterService', () => {
     gateway = module.get<EventsGateway>(EventsGateway);
   });
 
+  afterEach(() => {
+    service.onModuleDestroy();
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  });
+
   it('should be defined', () => {
     expect(service).toBeDefined();
   });
@@ -50,8 +58,8 @@ describe('NotificationBroadcasterService', () => {
 
       service.broadcastNewNotification(userAddress, notification);
 
-      // Wait for batch to be processed
-      await new Promise((resolve) => setTimeout(resolve, 1100));
+      // Advance timers to trigger batch processing
+      jest.advanceTimersByTime(1100);
 
       expect(mockServer.to).toHaveBeenCalledWith(`user:${userAddress}`);
       expect(mockServer.emit).toHaveBeenCalledWith(

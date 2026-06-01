@@ -3,6 +3,8 @@ import { NotFoundException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { NotificationsService } from './notifications.service';
 import { Notification, NotificationType } from './entities/notification.entity';
+import { NotificationBroadcasterService } from '../websocket/notification-broadcaster.service';
+import { EventsGateway } from '../websocket/events.gateway';
 
 describe('NotificationsService', () => {
   let service: NotificationsService;
@@ -27,6 +29,21 @@ describe('NotificationsService', () => {
     findOne: jest.fn(),
   };
 
+  const mockServer = {
+    to: jest.fn().mockReturnThis(),
+    emit: jest.fn(),
+  };
+
+  const mockGateway = {
+    server: mockServer,
+  };
+
+  const mockNotificationBroadcaster = {
+    broadcastNewNotification: jest.fn(),
+    broadcastNotificationRead: jest.fn(),
+    onModuleDestroy: jest.fn(),
+  };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -34,6 +51,14 @@ describe('NotificationsService', () => {
         {
           provide: getRepositoryToken(Notification),
           useValue: mockRepository,
+        },
+        {
+          provide: NotificationBroadcasterService,
+          useValue: mockNotificationBroadcaster,
+        },
+        {
+          provide: EventsGateway,
+          useValue: mockGateway,
         },
       ],
     }).compile();
@@ -66,6 +91,7 @@ describe('NotificationsService', () => {
         data: null,
       });
       expect(result).toEqual(mockNotification);
+      expect(mockNotificationBroadcaster.broadcastNewNotification).toHaveBeenCalled();
     });
 
     it('should pass data when provided', async () => {
@@ -152,6 +178,10 @@ describe('NotificationsService', () => {
       expect(mockRepository.update).toHaveBeenCalledWith(
         { id: 1, user_address: 'GBRPYHIL2CI3WHZDTOOQFC6EB4RRJC3XNRBF7XN' },
         { read: true },
+      );
+      expect(mockNotificationBroadcaster.broadcastNotificationRead).toHaveBeenCalledWith(
+        'GBRPYHIL2CI3WHZDTOOQFC6EB4RRJC3XNRBF7XN',
+        1,
       );
     });
   });
