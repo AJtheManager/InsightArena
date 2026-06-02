@@ -165,6 +165,61 @@ fn update_oracle_unauthorized() {
     assert!(matches!(result, Err(Ok(InsightArenaError::Unauthorized))));
 }
 
+// ── Issue #534: three additional named tests ──────────────────────────────────
+
+#[test]
+fn test_resolve_market_invalid_outcome() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, oracle) = deploy(&env);
+    let creator = Address::generate(&env);
+
+    // default_params has outcomes ["yes", "no"]
+    let id = client.create_market(&creator, &default_params(&env));
+    env.ledger().set_timestamp(env.ledger().timestamp() + 2000);
+
+    let result = client.try_resolve_market(&oracle, &id, &symbol_short!("maybe"));
+    assert!(matches!(result, Err(Ok(InsightArenaError::InvalidOutcome))));
+}
+
+#[test]
+fn test_resolve_already_resolved_market() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, oracle) = deploy(&env);
+    let creator = Address::generate(&env);
+
+    let id = client.create_market(&creator, &default_params(&env));
+    env.ledger().set_timestamp(env.ledger().timestamp() + 2000);
+
+    // First resolution succeeds.
+    client.resolve_market(&oracle, &id, &symbol_short!("yes"));
+
+    // Second attempt on the same market must fail.
+    let result = client.try_resolve_market(&oracle, &id, &symbol_short!("yes"));
+    assert!(matches!(
+        result,
+        Err(Ok(InsightArenaError::MarketAlreadyResolved))
+    ));
+}
+
+#[test]
+fn test_resolve_market_too_early() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, oracle) = deploy(&env);
+    let creator = Address::generate(&env);
+
+    // resolution_time = now + 2000; do not advance time at all.
+    let id = client.create_market(&creator, &default_params(&env));
+
+    let result = client.try_resolve_market(&oracle, &id, &symbol_short!("yes"));
+    assert!(matches!(
+        result,
+        Err(Ok(InsightArenaError::MarketStillOpen))
+    ));
+}
+
 // New test: ensure oracle cannot resolve before resolution_time
 #[test]
 fn test_resolve_market_before_resolution_time() {

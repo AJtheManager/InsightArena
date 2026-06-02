@@ -1897,6 +1897,92 @@ fn test_calculate_depth_first_level_is_one() {
     assert_eq!(client.calculate_conditional_depth(&child_id), 1);
 }
 
+// ── Issue #581: three named creation tests ────────────────────────────────────
+
+#[test]
+fn test_create_conditional_market_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let creator = Address::generate(&env);
+
+    let parent_id = client.create_market(&creator, &default_params(&env));
+    let child_id = client.create_conditional_market(
+        &creator,
+        &parent_id,
+        &symbol_short!("yes"),
+        &conditional_params(&env, &client, parent_id),
+    );
+
+    // Market is accessible via get_market.
+    let child_market = client.get_market(&child_id);
+    assert_eq!(child_market.market_id, child_id);
+
+    // ConditionalMarket metadata is stored correctly.
+    let cond = read_conditional(&env, &client, child_id);
+    assert_eq!(cond.parent_market_id, parent_id);
+    assert_eq!(cond.required_outcome, symbol_short!("yes"));
+    assert!(!cond.is_activated);
+    assert_eq!(cond.activation_time, None);
+}
+
+#[test]
+fn test_create_conditional_market_depth_limit_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let creator = Address::generate(&env);
+
+    // Build a chain at maximum depth (5 levels deep from root).
+    let mut parent = client.create_market(&creator, &default_params(&env));
+    for _ in 0..5 {
+        parent = client.create_conditional_market(
+            &creator,
+            &parent,
+            &symbol_short!("yes"),
+            &conditional_params(&env, &client, parent),
+        );
+    }
+
+    // Depth is now 5; any further nesting must be rejected.
+    let result = client.try_create_conditional_market(
+        &creator,
+        &parent,
+        &symbol_short!("yes"),
+        &conditional_params(&env, &client, parent),
+    );
+    assert!(matches!(
+        result,
+        Err(Ok(InsightArenaError::ConditionalDepthExceeded))
+    ));
+}
+
+#[test]
+fn test_create_conditional_market_stores_parent_reference() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let creator = Address::generate(&env);
+
+    let parent_id = client.create_market(&creator, &default_params(&env));
+    let child_id = client.create_conditional_market(
+        &creator,
+        &parent_id,
+        &symbol_short!("yes"),
+        &conditional_params(&env, &client, parent_id),
+    );
+
+    // The ConditionalParent storage key must point back to the parent.
+    let contract_id = client.address.clone();
+    let stored_parent: u64 = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ConditionalParent(child_id))
+            .unwrap()
+    });
+    assert_eq!(stored_parent, parent_id);
+}
+
 #[test]
 fn test_calculate_depth_nested_three_levels() {
     let env = Env::default();
