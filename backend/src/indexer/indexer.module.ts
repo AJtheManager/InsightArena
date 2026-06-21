@@ -4,10 +4,12 @@ import { CacheModule } from '@nestjs/cache-manager';
 import { ContractEvent } from './entities/contract-event.entity';
 import { FeeHistory } from './entities/fee-history.entity';
 import { IndexerCheckpoint } from './entities/indexer-checkpoint.entity';
+import { ChainSyncCheckpoint } from './entities/chain-sync-checkpoint.entity';
 import { IndexerService } from './indexer.service';
 import { IndexerController } from './indexer.controller';
 import { IndexerHealthController } from './indexer-health.controller';
 import { IndexerHealthService } from './health.service';
+import { ReconciliationService } from './reconciliation.service';
 import { CreatorEvent } from '../matches/entities/creator-event.entity';
 import { CreatorEventLeaderboardEntry } from '../matches/entities/creator-event-leaderboard-entry.entity';
 import { CreatorEventPayout } from '../matches/entities/creator-event-payout.entity';
@@ -23,6 +25,7 @@ import { WebsocketModule } from '../websocket/websocket.module';
       ContractEvent,
       FeeHistory,
       IndexerCheckpoint,
+      ChainSyncCheckpoint,
       CreatorEvent,
       CreatorEventLeaderboardEntry,
       CreatorEventPayout,
@@ -35,7 +38,7 @@ import { WebsocketModule } from '../websocket/websocket.module';
     WebsocketModule,
   ],
   controllers: [IndexerController, IndexerHealthController],
-  providers: [IndexerService, IndexerHealthService],
-  exports: [IndexerService, IndexerHealthService],
+  providers: [IndexerService, IndexerHealthService, ReconciliationService],
+  exports: [IndexerService, IndexerHealthService, ReconciliationService],
 })
 export class IndexerModule {}
