@@ -11,7 +11,11 @@ import { Repository, DataSource } from 'typeorm';
 import { Prediction } from './entities/prediction.entity';
 import { SubmitPredictionDto } from './dto/submit-prediction.dto';
 import { UpdatePredictionNoteDto } from './dto/update-prediction-note.dto';
-import { ListMarketPredictionsDto } from './dto/list-market-predictions.dto';
+import {
+  ListMarketPredictionsDto,
+  MarketPredictionResponseDto,
+  PaginatedMarketPredictionsResponse,
+} from './dto/list-market-predictions.dto';
 import {
   ListMyPredictionsDto,
   PredictionStatus,
@@ -286,7 +290,7 @@ export class PredictionsService {
   async findByMarket(
     marketId: string,
     dto: ListMarketPredictionsDto,
-  ): Promise<{ data: any[]; total: number; page: number; limit: number }> {
+  ): Promise<PaginatedMarketPredictionsResponse> {
     const market = await this.marketsRepository.findOne({
       where: { id: marketId },
     });
@@ -310,7 +314,7 @@ export class PredictionsService {
       take: limit,
     });
 
-    const data = predictions.map((p) => ({
+    const data: MarketPredictionResponseDto[] = predictions.map((p) => ({
       id: p.id,
       chosen_outcome: p.chosen_outcome,
       stake_amount_stroops: p.stake_amount_stroops,

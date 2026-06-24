@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import {
@@ -20,13 +20,16 @@ interface AuthenticatedSocket extends Socket {
   cors: { origin: '*', credentials: true },
   namespace: '/ws',
 })
-export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class EventsGateway
+  implements OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
+{
   @WebSocketServer()
   server: Server;
 
   private readonly logger = new Logger(EventsGateway.name);
   private readonly connections = new Map<string, string>(); // socketId → userAddress
   private readonly rateLimits = new Map<string, number>(); // socketId → message count
+  private readonly heartbeats = new Map<string, NodeJS.Timeout>();
   private readonly RATE_LIMIT = 60; // messages per minute
   private readonly RATE_WINDOW = 60_000;
 
@@ -63,18 +66,29 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const heartbeat = setInterval(() => {
       client.emit('ping');
     }, 25_000);
+    heartbeat.unref?.();
+    this.clearHeartbeat(client.id);
+    this.heartbeats.set(client.id, heartbeat);
 
     client.on('pong', () => {
       this.logger.debug(`Pong from ${client.id}`);
     });
 
-    client.on('disconnect', () => clearInterval(heartbeat));
+    client.on('disconnect', () => this.clearHeartbeat(client.id));
   }
 
   handleDisconnect(client: AuthenticatedSocket): void {
+    this.clearHeartbeat(client.id);
     this.connections.delete(client.id);
     this.rateLimits.delete(client.id);
     this.logger.log(`Client disconnected: ${client.id}`);
+  }
+
+  onModuleDestroy(): void {
+    for (const heartbeat of this.heartbeats.values()) {
+      clearInterval(heartbeat);
+    }
+    this.heartbeats.clear();
   }
 
   @SubscribeMessage('join')
@@ -137,9 +151,20 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (count >= this.RATE_LIMIT) return false;
     this.rateLimits.set(socketId, count + 1);
     if (count === 0) {
-      setTimeout(() => this.rateLimits.delete(socketId), this.RATE_WINDOW);
+      const timeout = setTimeout(
+        () => this.rateLimits.delete(socketId),
+        this.RATE_WINDOW,
+      );
+      timeout.unref?.();
     }
     return true;
+  }
+
+  private clearHeartbeat(socketId: string): void {
+    const heartbeat = this.heartbeats.get(socketId);
+    if (!heartbeat) return;
+    clearInterval(heartbeat);
+    this.heartbeats.delete(socketId);
   }
 
   getServer(): Server {

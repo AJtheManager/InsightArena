@@ -26,7 +26,11 @@ import {
   PaginatedMyPredictionsResponse,
   PredictionWithStatus,
 } from './dto/list-my-predictions.dto';
-import { ListMarketPredictionsDto } from './dto/list-market-predictions.dto';
+import {
+  ListMarketPredictionsDto,
+  PaginatedMarketPredictionsResponse,
+  PaginatedMarketPredictionsResponseDto,
+} from './dto/list-market-predictions.dto';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Public } from '../common/decorators/public.decorator';
 import { User } from '../users/entities/user.entity';
@@ -139,15 +143,18 @@ export class PredictionsController {
   @Public()
   @Get('market/:marketId')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Get paginated, anonymized predictions for a market (public)' })
+  @ApiOperation({
+    summary: 'Get paginated, anonymized predictions for a market (public)',
+  })
   @ApiResponse({
     status: 200,
     description: 'Paginated, anonymized predictions list',
+    type: PaginatedMarketPredictionsResponseDto,
   })
   async getMarketPredictions(
     @Param('marketId', ParseUUIDPipe) marketId: string,
     @Query() query: ListMarketPredictionsDto,
-  ): Promise<{ data: any[]; total: number; page: number; limit: number }> {
+  ): Promise<PaginatedMarketPredictionsResponse> {
     return this.predictionsService.findByMarket(marketId, query);
   }
 }

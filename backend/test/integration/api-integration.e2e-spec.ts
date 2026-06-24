@@ -33,7 +33,7 @@ import { UserAchievement } from '../../src/achievements/entities/user-achievemen
 import { Achievement } from '../../src/achievements/entities/achievement.entity';
 import { UserFollow } from '../../src/users/entities/user-follow.entity';
 import { Comment } from '../../src/markets/entities/comment.entity';
-import { Bookmark } from '../../src/markets/entities/bookmark.entity';
+import { UserBookmark } from '../../src/markets/entities/user-bookmark.entity';
 import { CompetitionParticipant } from '../../src/competitions/entities/competition-participant.entity';
 import { Flag } from '../../src/flags/entities/flag.entity';
 
@@ -100,7 +100,7 @@ const allEntities = [
   Achievement,
   UserFollow,
   Comment,
-  Bookmark,
+  UserBookmark,
   CompetitionParticipant,
   Flag,
 ];

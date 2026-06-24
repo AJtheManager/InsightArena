@@ -14,7 +14,7 @@ import { User } from '../users/entities/user.entity';
 import { SorobanService } from '../soroban/soroban.service';
 
 type MockRepo<T extends ObjectLiteral> = jest.Mocked<
-  Pick<Repository<T>, 'findOne' | 'create' | 'save'>
+  Pick<Repository<T>, 'findOne' | 'create' | 'save' | 'findAndCount'>
 >;
 
 const makeUser = (overrides: Partial<User> = {}): User =>
@@ -74,12 +74,14 @@ describe('PredictionsService', () => {
       findOne: jest.fn(),
       create: jest.fn(),
       save: jest.fn(),
+      findAndCount: jest.fn(),
     };
 
     mockMarketsRepo = {
       findOne: jest.fn(),
       create: jest.fn(),
       save: jest.fn(),
+      findAndCount: jest.fn(),
     };
 
     mockSoroban = {
@@ -511,11 +513,19 @@ describe('PredictionsService', () => {
           submitted_at: new Date(),
         },
       ];
-      mockPredictionsRepo.findAndCount = jest.fn().mockResolvedValue([mockPredictions, 1]);
+      mockPredictionsRepo.findAndCount.mockResolvedValue([
+        mockPredictions as Prediction[],
+        1,
+      ]);
 
-      const result = await service.findByMarket(market.id, { page: 1, limit: 10 });
+      const result = await service.findByMarket(market.id, {
+        page: 2,
+        limit: 10,
+      });
 
       expect(result.total).toBe(1);
+      expect(result.page).toBe(2);
+      expect(result.limit).toBe(10);
       expect(result.data[0]).toEqual({
         id: 'pred-1',
         chosen_outcome: 'Yes',
@@ -527,15 +537,25 @@ describe('PredictionsService', () => {
       });
       expect(result.data[0]).not.toHaveProperty('user');
       expect(result.data[0]).not.toHaveProperty('userId');
+      expect(mockPredictionsRepo.findAndCount).toHaveBeenCalledWith({
+        where: { market: { id: market.id } },
+        order: { submitted_at: 'DESC' },
+        skip: 10,
+        take: 10,
+      });
     });
 
     it('returns empty list for non-existent market', async () => {
       mockMarketsRepo.findOne.mockResolvedValue(null);
 
-      const result = await service.findByMarket('non-existent', { page: 1, limit: 10 });
+      const result = await service.findByMarket('non-existent', {
+        page: 1,
+        limit: 10,
+      });
 
       expect(result.total).toBe(0);
       expect(result.data).toEqual([]);
+      expect(mockPredictionsRepo.findAndCount).not.toHaveBeenCalled();
     });
   });
 });

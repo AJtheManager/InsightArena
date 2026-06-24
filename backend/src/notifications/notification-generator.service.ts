@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Notification, NotificationType } from './entities/notification.entity';
@@ -19,12 +19,13 @@ export interface NotificationBatch {
 }
 
 @Injectable()
-export class NotificationGeneratorService {
+export class NotificationGeneratorService implements OnModuleDestroy {
   private readonly logger = new Logger(NotificationGeneratorService.name);
   private readonly notificationQueue: Array<NotificationBatch> = [];
   private isProcessing = false;
   private readonly BATCH_SIZE = 50;
   private readonly FLUSH_INTERVAL = 5000; // 5 seconds
+  private queueProcessorInterval?: NodeJS.Timeout;
 
   constructor(
     @InjectRepository(Notification)
@@ -41,6 +42,13 @@ export class NotificationGeneratorService {
     private readonly userRepository: Repository<User>,
   ) {
     this.startQueueProcessor();
+  }
+
+  onModuleDestroy(): void {
+    if (this.queueProcessorInterval) {
+      clearInterval(this.queueProcessorInterval);
+      this.queueProcessorInterval = undefined;
+    }
   }
 
   async handleEventCreated(data: Record<string, unknown>): Promise<void> {
@@ -324,9 +332,10 @@ export class NotificationGeneratorService {
   }
 
   private startQueueProcessor(): void {
-    setInterval(() => {
+    this.queueProcessorInterval = setInterval(() => {
       void this.processQueue();
     }, this.FLUSH_INTERVAL);
+    this.queueProcessorInterval.unref?.();
   }
 
   private async processQueue(): Promise<void> {
