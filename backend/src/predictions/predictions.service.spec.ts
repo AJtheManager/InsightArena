@@ -70,6 +70,7 @@ describe('PredictionsService', () => {
       set: jest.fn().mockReturnThis(),
       setParameters: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
       execute: jest.fn().mockResolvedValue(undefined),
     };
 
@@ -146,6 +147,10 @@ describe('PredictionsService', () => {
         tx_hash: 'abc123',
         chosen_outcome: 'Yes',
       });
+      expect(qbMock.setParameter).toHaveBeenCalledWith(
+        'stakeAmount',
+        '10000000',
+      );
     });
 
     it('throws NotFoundException when market does not exist', async () => {
