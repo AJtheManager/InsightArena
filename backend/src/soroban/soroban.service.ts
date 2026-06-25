@@ -12,6 +12,7 @@ import {
 
 export interface SorobanPredictionResult {
   tx_hash: string;
+  payout_amount_stroops?: string;
 }
 
 export interface SorobanCreateMarketResult {
@@ -370,8 +371,14 @@ export class SorobanService {
         .padEnd(64, '0')
         .slice(0, 64);
 
-      this.logger.log(`claimPayout submitted: tx_hash=${tx_hash}`);
-      return Promise.resolve({ tx_hash });
+      // Calculate payout amount (in real implementation, this would come from contract)
+      // For stub: simulate a 1.5x return on stake
+      const payout_amount_stroops = '15000000'; // 1.5 XLM in stroops
+
+      this.logger.log(
+        `claimPayout submitted: tx_hash=${tx_hash} payout=${payout_amount_stroops}`,
+      );
+      return Promise.resolve({ tx_hash, payout_amount_stroops });
     });
   }
 

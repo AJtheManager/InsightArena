@@ -10,6 +10,7 @@ import { Repository, ObjectLiteral } from 'typeorm';
 import { PredictionsService } from './predictions.service';
 import { Prediction } from './entities/prediction.entity';
 import { Market } from '../markets/entities/market.entity';
+import { PredictionStatus } from './dto/list-my-predictions.dto';
 import { User } from '../users/entities/user.entity';
 import { SorobanService } from '../soroban/soroban.service';
 
@@ -271,6 +272,7 @@ describe('PredictionsService', () => {
         market,
         chosen_outcome: 'Yes',
         payout_claimed: false,
+        payout_amount_stroops: '0',
       } as Prediction;
 
       mockPredictionsRepo.findOne.mockResolvedValue(prediction);
@@ -278,17 +280,61 @@ describe('PredictionsService', () => {
         ...prediction,
         payout_claimed: true,
         tx_hash: 'claim-tx',
+        payout_amount_stroops: '15000000',
       });
-      mockSoroban.claimPayout.mockResolvedValue({ tx_hash: 'claim-tx' });
+      mockSoroban.claimPayout.mockResolvedValue({
+        tx_hash: 'claim-tx',
+        payout_amount_stroops: '15000000',
+      });
 
       const result = await service.claim('pred-1', user);
 
       expect(result.payout_claimed).toBe(true);
       expect(result.tx_hash).toBe('claim-tx');
+      expect(result.payout_amount_stroops).toBe('15000000');
 
       expect(mockSoroban.claimPayout).toHaveBeenCalledWith(
         user.stellar_address,
         market.on_chain_market_id,
+      );
+    });
+
+    it('persists payout_amount_stroops from Soroban response', async () => {
+      const user = makeUser();
+      const market = makeMarket({
+        is_resolved: true,
+        resolved_outcome: 'Yes',
+      });
+      const prediction = {
+        id: 'pred-1',
+        user,
+        market,
+        chosen_outcome: 'Yes',
+        payout_claimed: false,
+        payout_amount_stroops: '0',
+        stake_amount_stroops: '10000000',
+      } as Prediction;
+
+      mockPredictionsRepo.findOne.mockResolvedValue(prediction);
+
+      const saveMock = jest.fn().mockImplementation((entity: Prediction) => {
+        return Promise.resolve(entity);
+      });
+      mockPredictionsRepo.save = saveMock;
+
+      mockSoroban.claimPayout.mockResolvedValue({
+        tx_hash: 'claim-tx-123',
+        payout_amount_stroops: '20000000',
+      });
+
+      await service.claim('pred-1', user);
+
+      expect(saveMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payout_claimed: true,
+          tx_hash: 'claim-tx-123',
+          payout_amount_stroops: '20000000',
+        }),
       );
     });
 
@@ -565,6 +611,175 @@ describe('PredictionsService', () => {
       expect(result.total).toBe(0);
       expect(result.data).toEqual([]);
       expect(mockPredictionsRepo.findAndCount).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('findMine with status filter', () => {
+    let qbMock: {
+      leftJoinAndSelect: jest.Mock;
+      where: jest.Mock;
+      andWhere: jest.Mock;
+      orderBy: jest.Mock;
+      skip: jest.Mock;
+      take: jest.Mock;
+      getManyAndCount: jest.Mock;
+    };
+
+    beforeEach(() => {
+      qbMock = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
+      };
+
+      mockPredictionsRepo.createQueryBuilder = jest
+        .fn()
+        .mockReturnValue(qbMock);
+    });
+
+    it('should apply status filter at database level for Won status', async () => {
+      const user = makeUser();
+      const wonMarket = makeMarket({
+        is_resolved: true,
+        resolved_outcome: 'Yes',
+      });
+      const wonPrediction = {
+        id: 'pred-won',
+        user,
+        market: wonMarket,
+        chosen_outcome: 'Yes',
+        stake_amount_stroops: '10000000',
+        payout_claimed: false,
+        payout_amount_stroops: '0',
+        tx_hash: 'tx-won',
+        submitted_at: new Date(),
+      } as Prediction;
+
+      qbMock.getManyAndCount.mockResolvedValue([[wonPrediction], 1]);
+
+      const result = await service.findMine(user, {
+        page: 1,
+        limit: 20,
+        status: PredictionStatus.Won,
+      });
+
+      expect(result.total).toBe(1);
+      expect(result.data).toHaveLength(1);
+      expect(qbMock.andWhere).toHaveBeenCalledWith('market.is_resolved = :isResolved', {
+        isResolved: true,
+      });
+      expect(qbMock.andWhere).toHaveBeenCalledWith('market.is_cancelled = :isCancelled', {
+        isCancelled: false,
+      });
+      expect(qbMock.andWhere).toHaveBeenCalledWith(
+        'market.resolved_outcome = prediction.chosen_outcome',
+      );
+    });
+
+    it('should apply status filter at database level for Active status', async () => {
+      const user = makeUser();
+
+      await service.findMine(user, {
+        page: 1,
+        limit: 20,
+        status: PredictionStatus.Active,
+      });
+
+      expect(qbMock.andWhere).toHaveBeenCalledWith('market.is_resolved = :isResolved', {
+        isResolved: false,
+      });
+      expect(qbMock.andWhere).toHaveBeenCalledWith('market.is_cancelled = :isCancelled', {
+        isCancelled: false,
+      });
+    });
+
+    it('should apply status filter at database level for Lost status', async () => {
+      const user = makeUser();
+
+      await service.findMine(user, {
+        page: 1,
+        limit: 20,
+        status: PredictionStatus.Lost,
+      });
+
+      expect(qbMock.andWhere).toHaveBeenCalledWith('market.is_resolved = :isResolved', {
+        isResolved: true,
+      });
+      expect(qbMock.andWhere).toHaveBeenCalledWith('market.is_cancelled = :isCancelled', {
+        isCancelled: false,
+      });
+      expect(qbMock.andWhere).toHaveBeenCalledWith(
+        'market.resolved_outcome != prediction.chosen_outcome',
+      );
+    });
+
+    it('should apply status filter at database level for Pending status', async () => {
+      const user = makeUser();
+
+      await service.findMine(user, {
+        page: 1,
+        limit: 20,
+        status: PredictionStatus.Pending,
+      });
+
+      expect(qbMock.andWhere).toHaveBeenCalledWith('market.is_cancelled = :isCancelled', {
+        isCancelled: true,
+      });
+    });
+
+    it('should not filter when status is not provided', async () => {
+      const user = makeUser();
+
+      await service.findMine(user, {
+        page: 1,
+        limit: 20,
+      });
+
+      expect(qbMock.where).toHaveBeenCalledWith('prediction.userId = :userId', {
+        userId: user.id,
+      });
+      // andWhere should not be called for status filtering
+      const statusCalls = qbMock.andWhere.mock.calls.filter(
+        (call) =>
+          call[0].includes('is_resolved') ||
+          call[0].includes('is_cancelled') ||
+          call[0].includes('resolved_outcome'),
+      );
+      expect(statusCalls.length).toBe(0);
+    });
+
+    it('should return accurate total count with status filter', async () => {
+      const user = makeUser();
+      const wonMarket = makeMarket({
+        is_resolved: true,
+        resolved_outcome: 'Yes',
+      });
+      const predictions = Array.from({ length: 5 }, (_, i) => ({
+        id: `pred-${i}`,
+        user,
+        market: wonMarket,
+        chosen_outcome: 'Yes',
+        stake_amount_stroops: '10000000',
+        payout_claimed: false,
+        payout_amount_stroops: '0',
+        tx_hash: `tx-${i}`,
+        submitted_at: new Date(),
+      })) as Prediction[];
+
+      qbMock.getManyAndCount.mockResolvedValue([predictions, 25]);
+
+      const result = await service.findMine(user, {
+        page: 1,
+        limit: 5,
+        status: PredictionStatus.Won,
+      });
+
+      expect(result.total).toBe(25);
+      expect(result.data).toHaveLength(5);
     });
   });
 });

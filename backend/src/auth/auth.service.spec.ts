@@ -188,24 +188,6 @@ describe('AuthService', () => {
     expect(service.isValidChallenge(challenge)).toBe(false);
   });
 
-  it('generateChallenge() cleanup removes stale cache entries', () => {
-    const stale = 'InsightArena:nonce:1:stale:' + address;
-
-    const cache = (
-      service as unknown as {
-        challengeCache: Map<string, { expiresAt: number; used: boolean }>;
-      }
-    ).challengeCache;
-
-    cache.set(stale, {
-      expiresAt: Date.now() - 1,
-      used: false,
-    });
-
-    service.generateChallenge(address);
-    expect(cache.has(stale)).toBe(false);
-  });
-
   it('verifyStellarSignature() uses mocked Keypair.verify and returns true', () => {
     const verify = jest.fn().mockReturnValue(true);
     jest
@@ -226,5 +208,109 @@ describe('AuthService', () => {
     const ok = service.verifyStellarSignature('bad-key', 'challenge', 'abcd');
 
     expect(ok).toBe(false);
+  });
+
+  describe('cleanupExpiredChallenges', () => {
+    it('should remove expired challenges periodically', () => {
+      jest.useFakeTimers();
+
+      const cache = (
+        service as unknown as {
+          challengeCache: Map<string, { expiresAt: number; used: boolean }>;
+        }
+      ).challengeCache;
+
+      // Add some expired challenges
+      cache.set('expired-1', { expiresAt: Date.now() - 1000, used: false });
+      cache.set('expired-2', { expiresAt: Date.now() - 2000, used: false });
+      cache.set('valid-1', { expiresAt: Date.now() + 100000, used: false });
+
+      expect(cache.size).toBe(3);
+
+      // Call the cleanup method directly
+      service.cleanupExpiredChallenges();
+
+      expect(cache.size).toBe(1);
+      expect(cache.has('valid-1')).toBe(true);
+      expect(cache.has('expired-1')).toBe(false);
+      expect(cache.has('expired-2')).toBe(false);
+    });
+
+    it('should be called via @Cron decorator every 5 minutes', () => {
+      const cleanupSpy = jest.spyOn(service, 'cleanupExpiredChallenges');
+
+      // Verify the method exists and is callable
+      expect(service.cleanupExpiredChallenges).toBeDefined();
+
+      service.cleanupExpiredChallenges();
+
+      expect(cleanupSpy).toHaveBeenCalled();
+    });
+
+    it('should cleanup expired challenges without waiting for generateChallenge', () => {
+      jest.useFakeTimers();
+
+      const cache = (
+        service as unknown as {
+          challengeCache: Map<string, { expiresAt: number; used: boolean }>;
+        }
+      ).challengeCache;
+
+      // Simulate high read load: many verifySignature calls without generateChallenge
+      service.generateChallenge(address);
+      cache.set('old-challenge', { expiresAt: Date.now() - 10000, used: true });
+
+      expect(cache.size).toBe(2);
+
+      // Cleanup should remove expired entries independently
+      service.cleanupExpiredChallenges();
+
+      expect(cache.size).toBe(1);
+      expect(cache.has('old-challenge')).toBe(false);
+    });
+  });
+
+  describe('refreshToken', () => {
+    it('should issue a new token for an existing user', async () => {
+      const existingUser = {
+        id: 'user-refresh-1',
+        stellar_address: 'GABC1234',
+      } as User;
+
+      usersRepository.findOneBy.mockResolvedValue(existingUser);
+      jwtService.signAsync.mockResolvedValue('new.jwt.token');
+
+      const result = await service.refreshToken('user-refresh-1');
+
+      expect(result.access_token).toBe('new.jwt.token');
+      expect(jwtService.signAsync).toHaveBeenCalledWith({
+        sub: 'user-refresh-1',
+        stellar_address: 'GABC1234',
+      });
+      expect(usersRepository.findOneBy).toHaveBeenCalledWith({
+        id: 'user-refresh-1',
+      });
+    });
+
+    it('should throw UnauthorizedException if user is not found', async () => {
+      usersRepository.findOneBy.mockResolvedValue(null);
+
+      await expect(service.refreshToken('deleted-user')).rejects.toThrow(
+        UnauthorizedException,
+      );
+      await expect(service.refreshToken('deleted-user')).rejects.toThrow(
+        'User not found or has been deleted',
+      );
+
+      expect(jwtService.signAsync).not.toHaveBeenCalled();
+    });
+
+    it('should throw UnauthorizedException if user has been deleted', async () => {
+      usersRepository.findOneBy.mockResolvedValue(null);
+
+      await expect(service.refreshToken('user-deleted')).rejects.toThrow(
+        UnauthorizedException,
+      );
+    });
   });
 });

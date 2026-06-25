@@ -13,6 +13,7 @@ import { GenerateChallengeDto } from './dto/generate-challenge.dto';
 import { VerifyChallengeDto } from './dto/verify-challenge.dto';
 import { VerifyWalletDto } from './dto/verify-wallet.dto';
 import { RateLimitStatusDto } from './dto/rate-limit-status.dto';
+import { RefreshTokenResponseDto } from './dto/refresh-token.dto';
 import {
   ApiBearerAuth,
   ApiOperation,
@@ -21,6 +22,7 @@ import {
 } from '@nestjs/swagger';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { User } from '../users/entities/user.entity';
+import { ConfigService } from '@nestjs/config';
 
 @ApiTags('Auth')
 @Throttle({ default: { limit: 10, ttl: 60000 } })
@@ -29,6 +31,7 @@ export class AuthController {
   constructor(
     private readonly authService: AuthService,
     private readonly rateLimitService: RateLimitService,
+    private readonly configService: ConfigService,
   ) {}
 
   @Post('challenge')
@@ -77,5 +80,62 @@ export class AuthController {
     @CurrentUser() user: User,
   ): Promise<RateLimitStatusDto> {
     return this.rateLimitService.getStatus(user.id);
+  }
+
+  @Post('refresh')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Refresh JWT token',
+    description:
+      'Issues a new JWT token with a fresh expiry for the authenticated user without requiring a new wallet signature',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'New access token issued',
+    type: RefreshTokenResponseDto,
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or expired token, or user deleted',
+  })
+  async refreshToken(
+    @CurrentUser() user: User,
+  ): Promise<RefreshTokenResponseDto> {
+    const { access_token } = await this.authService.refreshToken(user.id);
+
+    // Calculate expiry timestamp
+    const expiresIn = this.configService.get<string>('JWT_EXPIRES_IN') || '7d';
+    const expiresMs = this.parseExpiryToMs(expiresIn);
+    const expires_at = new Date(Date.now() + expiresMs).toISOString();
+
+    return { access_token, expires_at };
+  }
+
+  /**
+   * Parse JWT_EXPIRES_IN format (e.g., '7d', '24h', '3600s') to milliseconds
+   */
+  private parseExpiryToMs(expiry: string): number {
+    const match = expiry.match(/^(\d+)([dhms])$/);
+    if (!match) {
+      // Default to 7 days if format is invalid
+      return 7 * 24 * 60 * 60 * 1000;
+    }
+
+    const value = parseInt(match[1], 10);
+    const unit = match[2];
+
+    switch (unit) {
+      case 'd':
+        return value * 24 * 60 * 60 * 1000;
+      case 'h':
+        return value * 60 * 60 * 1000;
+      case 'm':
+        return value * 60 * 1000;
+      case 's':
+        return value * 1000;
+      default:
+        return 7 * 24 * 60 * 60 * 1000;
+    }
   }
 }

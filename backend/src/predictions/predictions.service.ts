@@ -149,18 +149,46 @@ export class PredictionsService {
       .createQueryBuilder('prediction')
       .leftJoinAndSelect('prediction.market', 'market')
       .where('prediction.userId = :userId', { userId: user.id })
-      .orderBy('prediction.submitted_at', 'DESC')
-      .skip(skip)
-      .take(limit);
+      .orderBy('prediction.submitted_at', 'DESC');
+
+    // Apply status filter at the database level
+    if (dto.status) {
+      switch (dto.status) {
+        case PredictionStatus.Active:
+          qb.andWhere('market.is_resolved = :isResolved', { isResolved: false })
+            .andWhere('market.is_cancelled = :isCancelled', {
+              isCancelled: false,
+            });
+          break;
+        case PredictionStatus.Won:
+          qb.andWhere('market.is_resolved = :isResolved', { isResolved: true })
+            .andWhere('market.is_cancelled = :isCancelled', {
+              isCancelled: false,
+            })
+            .andWhere('market.resolved_outcome = prediction.chosen_outcome');
+          break;
+        case PredictionStatus.Lost:
+          qb.andWhere('market.is_resolved = :isResolved', { isResolved: true })
+            .andWhere('market.is_cancelled = :isCancelled', {
+              isCancelled: false,
+            })
+            .andWhere('market.resolved_outcome != prediction.chosen_outcome');
+          break;
+        case PredictionStatus.Pending:
+          qb.andWhere('market.is_cancelled = :isCancelled', {
+            isCancelled: true,
+          });
+          break;
+      }
+    }
+
+    qb.skip(skip).take(limit);
 
     const [predictions, total] = await qb.getManyAndCount();
 
-    const enriched: PredictionWithStatus[] = predictions
-      .map((p) => this.enrichWithStatus(p))
-      .filter((p): p is PredictionWithStatus => {
-        if (!dto.status) return true;
-        return p.status === dto.status;
-      });
+    const enriched: PredictionWithStatus[] = predictions.map((p) =>
+      this.enrichWithStatus(p),
+    );
 
     return { data: enriched, total, page, limit };
   }
@@ -276,13 +304,17 @@ export class PredictionsService {
       throw new BadRequestException('You did not win this prediction');
     }
 
-    const { tx_hash } = await this.sorobanService.claimPayout(
-      user.stellar_address,
-      market.on_chain_market_id,
-    );
+    const { tx_hash, payout_amount_stroops } =
+      await this.sorobanService.claimPayout(
+        user.stellar_address,
+        market.on_chain_market_id,
+      );
 
     prediction.payout_claimed = true;
     prediction.tx_hash = tx_hash;
+    if (payout_amount_stroops) {
+      prediction.payout_amount_stroops = payout_amount_stroops;
+    }
 
     return this.predictionsRepository.save(prediction);
   }

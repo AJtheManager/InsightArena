@@ -1,6 +1,12 @@
-import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  Logger,
+  OnModuleInit,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Cron } from '@nestjs/schedule';
 import { randomBytes } from 'crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import { Repository } from 'typeorm';
@@ -8,7 +14,7 @@ import { User } from '../users/entities/user.entity';
 import { UserPreferences } from '../users/entities/user-preferences.entity';
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleInit {
   private challengeCache = new Map<
     string,
     { expiresAt: number; used: boolean }
@@ -24,6 +30,32 @@ export class AuthService {
     private readonly preferencesRepository: Repository<UserPreferences>,
   ) {}
 
+  onModuleInit() {
+    this.logger.log('AuthService initialized - periodic cleanup enabled');
+  }
+
+  /**
+   * Periodically cleanup expired challenges every 5 minutes.
+   * This prevents memory leaks in read-heavy load scenarios where
+   * verifySignature is called frequently without intervening generateChallenge calls.
+   */
+  @Cron('*/5 * * * *')
+  cleanupExpiredChallenges(): void {
+    const now = Date.now();
+    let removed = 0;
+    for (const [key, entry] of this.challengeCache.entries()) {
+      if (now > entry.expiresAt) {
+        this.challengeCache.delete(key);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      this.logger.debug(
+        `Periodic cleanup removed ${removed} expired challenge(s)`,
+      );
+    }
+  }
+
   generateChallenge(stellar_address: string): string {
     const timestamp = Date.now();
     const random = randomBytes(16).toString('hex');
@@ -37,8 +69,6 @@ export class AuthService {
       expiresAt: timestamp + this.TTL_MS,
       used: false,
     });
-
-    this.cleanupExpiredChallenges();
 
     return challenge;
   }
@@ -70,6 +100,28 @@ export class AuthService {
     const access_token = await this.jwtService.signAsync(payload);
 
     return { access_token, user };
+  }
+
+  /**
+   * Refresh an existing JWT token.
+   * Issues a new token with a fresh expiry for the authenticated user.
+   * Validates that the user still exists and is active.
+   */
+  async refreshToken(userId: string): Promise<{ access_token: string }> {
+    // Verify user still exists and is active
+    const user = await this.usersRepository.findOneBy({ id: userId });
+
+    if (!user) {
+      throw new UnauthorizedException('User not found or has been deleted');
+    }
+
+    // Issue new token with same payload
+    const payload = { sub: user.id, stellar_address: user.stellar_address };
+    const access_token = await this.jwtService.signAsync(payload);
+
+    this.logger.debug(`Token refreshed for user ${userId}`);
+
+    return { access_token };
   }
 
   async verifySignature(
@@ -167,15 +219,6 @@ export class AuthService {
     } catch (error) {
       this.logger.error(`Error verifying signature: ${error}`);
       return false;
-    }
-  }
-
-  private cleanupExpiredChallenges(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.challengeCache.entries()) {
-      if (now > entry.expiresAt) {
-        this.challengeCache.delete(key);
-      }
     }
   }
 }
