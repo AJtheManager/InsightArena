@@ -179,6 +179,110 @@ fn test_withdraw_insufficient_balance_rejected() {
 }
 
 #[test]
+#[should_panic(expected = "contract_paused")]
+fn test_withdraw_fees_while_paused_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(creator_event_manager::CreatorEventManagerContract, ());
+    let client = CreatorEventManagerContractClient::new(&env, &contract_id);
+    let client: CreatorEventManagerContractClient<'static> =
+        unsafe { core::mem::transmute(client) };
+
+    let admin = Address::generate(&env);
+    let ai_agent = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let xlm_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    client.initialize(&admin, &ai_agent, &treasury, &xlm_token, &FEE);
+
+    // Create an event to deposit the creation fee into the treasury.
+    let creator = Address::generate(&env);
+    StellarAssetClient::new(&env, &xlm_token).mint(&creator, &FEE);
+
+    let start_time = get_future_time(&env, 3600);
+    let end_time = get_future_time(&env, 7200);
+    client.create_event(
+        &creator,
+        &title(&env),
+        &desc(&env),
+        &2u32,
+        &start_time,
+        &end_time,
+        &0i128,
+        &Vec::new(&env),
+        &0i128,
+    );
+
+    // Pause the contract.
+    client.pause(&admin);
+
+    let recipient = Address::generate(&env);
+    // withdraw_fees must be rejected while the contract is paused.
+    client.withdraw_fees(&admin, &recipient, &FEE);
+}
+
+#[test]
+fn test_withdraw_fees_after_unpause_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(creator_event_manager::CreatorEventManagerContract, ());
+    let client = CreatorEventManagerContractClient::new(&env, &contract_id);
+    let client: CreatorEventManagerContractClient<'static> =
+        unsafe { core::mem::transmute(client) };
+
+    let admin = Address::generate(&env);
+    let ai_agent = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let xlm_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    client.initialize(&admin, &ai_agent, &treasury, &xlm_token, &FEE);
+
+    // Create an event to deposit the creation fee into the treasury.
+    let creator = Address::generate(&env);
+    StellarAssetClient::new(&env, &xlm_token).mint(&creator, &FEE);
+
+    let start_time = get_future_time(&env, 3600);
+    let end_time = get_future_time(&env, 7200);
+    client.create_event(
+        &creator,
+        &title(&env),
+        &desc(&env),
+        &2u32,
+        &start_time,
+        &end_time,
+        &0i128,
+        &Vec::new(&env),
+        &0i128,
+    );
+
+    assert_eq!(client.get_treasury_balance(), FEE);
+
+    // Grant the contract an allowance to pull funds from the treasury.
+    let token = TokenClient::new(&env, &xlm_token);
+    token.approve(&treasury, &contract_id, &FEE, &0u32);
+
+    // Pause then unpause the contract.
+    client.pause(&admin);
+    client.unpause(&admin);
+
+    // withdraw_fees must succeed after the contract is unpaused.
+    let recipient = Address::generate(&env);
+    client.withdraw_fees(&admin, &recipient, &FEE);
+
+    let token = TokenClient::new(&env, &xlm_token);
+    assert_eq!(token.balance(&recipient), FEE);
+    assert_eq!(client.get_treasury_balance(), 0);
+}
+
+#[test]
 #[should_panic(expected = "invalid_amount")]
 fn test_withdraw_zero_amount_rejected() {
     let env = Env::default();

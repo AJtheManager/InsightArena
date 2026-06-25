@@ -757,6 +757,53 @@ fn test_add_match_team_time_can_be_in_future() {
     assert_eq!(stored.match_time, future_time);
 }
 
+// =============================================================================
+// create_match on a cancelled event (#1032)
+// =============================================================================
+
+#[test]
+#[should_panic(expected = "event_cancelled")]
+fn test_create_match_on_cancelled_event_panics_event_cancelled() {
+    let (env, client, _contract_id, _admin, xlm_token) = setup();
+    let creator = Address::generate(&env);
+    fund(&env, &xlm_token, &creator, FEE);
+
+    let (event_id, _) = create_event_default(&client, &env, &creator, 5u32);
+
+    // Transition the event to cancelled state via the contract entry point.
+    client.cancel_event(&creator, &event_id);
+
+    // create_match on a cancelled event must panic with "event_cancelled".
+    client.create_match(
+        &creator,
+        &event_id,
+        &String::from_str(&env, "Team A"),
+        &String::from_str(&env, "Team B"),
+        &get_future_time(&env, 4000),
+        &1u32,
+    );
+}
+
+#[test]
+fn test_create_match_on_non_cancelled_event_same_creator_succeeds() {
+    let (env, client, _contract_id, _admin, xlm_token) = setup();
+    let creator = Address::generate(&env);
+    fund(&env, &xlm_token, &creator, FEE);
+
+    let (event_id, _) = create_event_default(&client, &env, &creator, 5u32);
+
+    // Event is active; create_match by the same creator must succeed.
+    let match_id = client.create_match(
+        &creator,
+        &event_id,
+        &String::from_str(&env, "Team A"),
+        &String::from_str(&env, "Team B"),
+        &get_future_time(&env, 4000),
+        &1u32,
+    );
+    assert!(match_id >= 1);
+}
+
 #[test]
 fn test_add_match_team_time_can_be_in_past() {
     let (env, client, contract_id, _admin, xlm_token) = setup();

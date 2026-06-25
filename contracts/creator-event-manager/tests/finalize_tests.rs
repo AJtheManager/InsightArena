@@ -509,6 +509,75 @@ fn test_finalize_event_zero_prize_pool_noop() {
     assert!(client.get_event(&event_id).is_finalized);
 }
 
+// ---------------------------------------------------------------------------
+// get_event_payouts — pre-finalization, non-existent, post-finalization (#1033)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_event_payouts_before_finalization_returns_empty() {
+    let (env, client, contract_id, creator, _ai_agent, xlm_token) = setup();
+
+    let dist = reward_dist(&env, &[100]);
+    let (event_id, _invite, _match_ids) = create_funded_event(
+        &env,
+        &contract_id,
+        &client,
+        &creator,
+        &xlm_token,
+        PRIZE,
+        dist,
+        1,
+    );
+
+    // The event is funded but finalize_event has not been called yet.
+    let payouts = client.get_event_payouts(&event_id);
+    assert_eq!(payouts.len(), 0);
+}
+
+#[test]
+fn test_get_event_payouts_nonexistent_event_returns_empty() {
+    let (_env, client, _contract_id, _creator, _ai_agent, _xlm_token) = setup();
+
+    // No event with this ID has ever been created; must return empty, not panic.
+    let payouts = client.get_event_payouts(&99999u64);
+    assert_eq!(payouts.len(), 0);
+}
+
+#[test]
+fn test_get_event_payouts_after_finalization_returns_correct_entries() {
+    let (env, client, contract_id, creator, ai_agent, xlm_token) = setup();
+
+    let dist = reward_dist(&env, &[100]);
+    let (event_id, invite_code, match_ids) = create_funded_event(
+        &env,
+        &contract_id,
+        &client,
+        &creator,
+        &xlm_token,
+        PRIZE,
+        dist,
+        1,
+    );
+
+    let user = Address::generate(&env);
+    client.join_event(&user, &invite_code);
+    client.submit_prediction(&user, &match_ids.get(0).unwrap(), &1u32, &0u32);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 7300);
+    submit_result(&client, &ai_agent, match_ids.get(0).unwrap(), MatchResult::TeamA);
+
+    let caller = Address::generate(&env);
+    let payouts = client.finalize_event(&caller, &event_id);
+
+    // Snapshot must match the returned payout vector.
+    let snapshot = client.get_event_payouts(&event_id);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot, payouts);
+    let (winner, amount) = snapshot.get(0).unwrap();
+    assert_eq!(winner, user);
+    assert_eq!(amount, PRIZE);
+}
+
 #[test]
 fn test_finalize_event_permissionless() {
     let (env, client, contract_id, creator, ai_agent, xlm_token) = setup();

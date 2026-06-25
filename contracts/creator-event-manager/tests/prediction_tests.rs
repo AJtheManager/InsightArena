@@ -1132,6 +1132,74 @@ fn test_entry_fee_insufficient_by_one_stroop_rejected() {
     client.join_event(&user, &invite_code);
 }
 
+// ---------------------------------------------------------------------------
+// Ledger-time-advancing tests (#1034)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "match_started")]
+fn test_submit_prediction_well_after_kickoff_7200_rejected() {
+    let (env, client, contract_id, _admin, xlm_token) = setup();
+    let creator = Address::generate(&env);
+    let predictor = Address::generate(&env);
+
+    let match_time_offset: u64 = 1000;
+    let initial_ts = env.ledger().timestamp();
+    let match_time = initial_ts + match_time_offset;
+
+    let (_event_id, invite_code, match_id) = create_event_and_match(
+        &env,
+        &contract_id,
+        &client,
+        &creator,
+        &xlm_token,
+        2,
+        match_time_offset,
+    );
+
+    client.join_event(&predictor, &invite_code);
+
+    // Advance to match_time + 7200 — well past kickoff.
+    env.ledger().with_mut(|l| l.timestamp = match_time + 7200);
+
+    client.submit_prediction(&predictor, &match_id, &1u32, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "match_started")]
+fn test_submit_prediction_after_result_submitted_rejected() {
+    let (env, client, contract_id, _admin, xlm_token) = setup();
+    // Retrieve the registered AI agent address so submit_match_result passes the role check.
+    let ai_agent = client.get_ai_agent();
+    let creator = Address::generate(&env);
+    let predictor = Address::generate(&env);
+
+    let match_time_offset: u64 = 1000;
+    let initial_ts = env.ledger().timestamp();
+    let match_time = initial_ts + match_time_offset;
+
+    let (_event_id, invite_code, match_id) = create_event_and_match(
+        &env,
+        &contract_id,
+        &client,
+        &creator,
+        &xlm_token,
+        2,
+        match_time_offset,
+    );
+
+    client.join_event(&predictor, &invite_code);
+
+    // Advance past match_time so the oracle can submit a result.
+    env.ledger().with_mut(|l| l.timestamp = match_time + 1);
+
+    // AI agent submits the match result.
+    client.submit_match_result(&ai_agent, &match_id, &1u32, &0u32);
+
+    // Prediction after result submission must be rejected with "match_started".
+    client.submit_prediction(&predictor, &match_id, &1u32, &0u32);
+}
+
 /// Zero fee test: a user with no XLM can join an event whose entry_fee = 0;
 /// no token transfer must occur and the prize pool stays unchanged.
 #[test]
