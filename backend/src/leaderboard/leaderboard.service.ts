@@ -115,7 +115,9 @@ export class LeaderboardService {
       reputation_score: entry.reputation_score,
       accuracy_rate:
         entry.total_predictions > 0
-          ? ((entry.correct_predictions / entry.total_predictions) * 100).toFixed(1)
+          ? ((entry.correct_predictions / entry.total_predictions) * 100).toFixed(
+              1,
+            )
           : '0.0',
       total_winnings_stroops: entry.total_winnings_stroops,
       season_points: entry.season_points,

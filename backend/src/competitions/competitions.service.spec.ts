@@ -27,6 +27,7 @@ describe('CompetitionsService', () => {
     end_time: new Date('2026-06-30'),
     prize_pool_stroops: '5000000000',
     visibility: CompetitionVisibility.Public,
+    is_cancelled: false,
     invite_code: undefined,
     created_at: new Date('2024-01-01'),
   };
@@ -69,21 +70,21 @@ describe('CompetitionsService', () => {
             return (
               competition.start_time! <= currentNow &&
               competition.end_time! >= currentNow &&
-              competition.is_cancelled === false
+              competition.is_cancelled !== true
             );
           }
 
           if (statusClause.includes('start_time > :now')) {
             return (
               competition.start_time! > currentNow &&
-              competition.is_cancelled === false
+              competition.is_cancelled !== true
             );
           }
 
           if (statusClause.includes('end_time < :now')) {
             return (
               competition.end_time! < currentNow &&
-              competition.is_cancelled === false
+              competition.is_cancelled !== true
             );
           }
 
