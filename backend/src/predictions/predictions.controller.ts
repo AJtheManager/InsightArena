@@ -33,6 +33,7 @@ import {
 } from './dto/list-market-predictions.dto';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Public } from '../common/decorators/public.decorator';
+import { Idempotent } from '../common/idempotency/idempotent.decorator';
 import { User } from '../users/entities/user.entity';
 import { Prediction } from './entities/prediction.entity';
 
@@ -44,6 +45,7 @@ export class PredictionsController {
 
   @Post()
   @UseGuards(BanGuard)
+  @Idempotent()
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({ summary: 'Submit a prediction on a market' })
   @ApiResponse({
@@ -51,11 +53,15 @@ export class PredictionsController {
     description: 'Prediction submitted',
     type: Prediction,
   })
-  @ApiResponse({ status: 400, description: 'Market closed or invalid outcome' })
+  @ApiResponse({ status: 400, description: 'Market closed, invalid outcome, or missing Idempotency-Key' })
   @ApiResponse({ status: 404, description: 'Market not found' })
   @ApiResponse({
     status: 409,
-    description: 'Duplicate prediction on this market',
+    description: 'Duplicate prediction on this market, or a request with the same Idempotency-Key is already in progress',
+  })
+  @ApiResponse({
+    status: 422,
+    description: 'Idempotency-Key reused with a different request body',
   })
   async submit(
     @Body() dto: SubmitPredictionDto,
