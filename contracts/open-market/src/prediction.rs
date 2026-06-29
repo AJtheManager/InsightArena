@@ -640,7 +640,8 @@ pub fn batch_distribute_payouts(
     }
 
     if winning_pool <= 0 {
-        return Err(InsightArenaError::EscrowEmpty);
+        emit_batch_payout_complete(env, market_id, &caller, 0);
+        return Ok(0);
     }
 
     let loser_pool = market

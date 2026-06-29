@@ -1590,3 +1590,87 @@ fn test_get_outcome_price_reflects_post_swap_reserves() {
         "Total reserves should reflect net change from swap"
     );
 }
+
+#[test]
+fn test_liquidity_no_trade_returns_exact_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let creator = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let market_id = client.create_market(&creator, &lp_market_params(&env));
+
+    let initial_deposit = 1_000_i128;
+    sa.mint(&provider, &initial_deposit);
+    token.approve(&provider, &client.address, &initial_deposit, &9999);
+    let lp_tokens = client.add_liquidity(&provider, &market_id, &initial_deposit);
+
+    // No swaps — removing all LP tokens returns exactly the deposit
+    let withdrawn = client.remove_liquidity(&provider, &market_id, &lp_tokens);
+    assert_eq!(withdrawn, initial_deposit);
+
+    let providers = client.get_all_lp_providers(&market_id);
+    assert_eq!(providers.len(), 0);
+}
+
+#[test]
+fn test_liquidity_fee_accumulation_end_to_end() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let creator = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let trader = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let market_id = client.create_market(&creator, &lp_market_params(&env));
+
+    // Add liquidity
+    let initial_deposit = 100_000_i128;
+    sa.mint(&provider, &initial_deposit);
+    token.approve(&provider, &client.address, &initial_deposit, &9999);
+    let lp_tokens = client.add_liquidity(&provider, &market_id, &initial_deposit);
+
+    // Execute 5 swaps to accumulate fees
+    let swap_amount = 5_000_i128;
+    sa.mint(&trader, &(swap_amount * 5));
+    token.approve(&trader, &client.address, &(swap_amount * 5), &9999);
+    for _ in 0..5 {
+        client.swap_outcome(
+            &trader,
+            &market_id,
+            &symbol_short!("yes"),
+            &symbol_short!("no"),
+            &swap_amount,
+            &0_i128,
+        );
+    }
+
+    // Verify fees were accumulated in the LP position
+    let position = client.get_lp_position(&provider, &market_id);
+    let fees_earned = position.fees_earned;
+    assert!(fees_earned > 0);
+
+    // Collect fees before removing LP tokens (position is deleted on full removal)
+    let collected = client.collect_lp_fees(&provider, &market_id);
+    assert_eq!(collected, fees_earned);
+
+    // Remove all LP tokens — returns principal only
+    let withdrawn = client.remove_liquidity(&provider, &market_id, &lp_tokens);
+    assert_eq!(withdrawn, initial_deposit);
+
+    // Total returned (principal + fees) exceeds the initial deposit
+    assert!(withdrawn + collected > initial_deposit);
+
+    // Pool is empty after full withdrawal
+    let providers = client.get_all_lp_providers(&market_id);
+    assert_eq!(providers.len(), 0);
+}
