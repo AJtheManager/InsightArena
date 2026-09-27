@@ -17,7 +17,9 @@ import {
   MarketNotResolvedException,
   PredictionNotWonException,
   NoClaimableRewardsException,
+  NoteTooLongException,
 } from './exceptions';
+import { PREDICTION_NOTE_MAX_LENGTH } from './dto/update-prediction-note.dto';
 import { Repository, ObjectLiteral } from 'typeorm';
 import { PredictionsService } from './predictions.service';
 import { Prediction } from './entities/prediction.entity';
@@ -976,6 +978,107 @@ describe('PredictionsService', () => {
         service.updateNote('non-existent', { note: 'Some note' }, makeUser()),
       ).rejects.toThrow(PredictionNotFoundException);
       expect(submitPrediction).not.toHaveBeenCalled();
+    });
+
+    it('should strip HTML/script markup from the note before saving', async () => {
+      const user = makeUser();
+      const market = makeMarket();
+      const prediction = {
+        id: 'pred-1',
+        user,
+        market,
+        chosen_outcome: 'Yes',
+        note: null,
+      } as unknown as Prediction;
+
+      mockPredictionsRepo.findOne.mockResolvedValue(prediction);
+      mockPredictionsRepo.save.mockImplementation((entity: Prediction) =>
+        Promise.resolve(entity),
+      );
+
+      const result = await service.updateNote(
+        'pred-1',
+        { note: '<script>alert(1)</script>Looks bullish' },
+        user,
+      );
+
+      expect(result.note).toBe('alert(1)Looks bullish');
+      expect(result.note).not.toContain('<script>');
+    });
+
+    it('should strip control characters from the note before saving', async () => {
+      const user = makeUser();
+      const market = makeMarket();
+      const prediction = {
+        id: 'pred-1',
+        user,
+        market,
+        chosen_outcome: 'Yes',
+        note: null,
+      } as unknown as Prediction;
+
+      mockPredictionsRepo.findOne.mockResolvedValue(prediction);
+      mockPredictionsRepo.save.mockImplementation((entity: Prediction) =>
+        Promise.resolve(entity),
+      );
+
+      const result = await service.updateNote(
+        'pred-1',
+        { note: 'Bad\u0000actor\u0007note' },
+        user,
+      );
+
+      expect(result.note).toBe('Badactornote');
+    });
+
+    it('should throw NoteTooLongException when the sanitized note exceeds the max length', async () => {
+      const user = makeUser();
+      const market = makeMarket();
+      const prediction = {
+        id: 'pred-1',
+        user,
+        market,
+        chosen_outcome: 'Yes',
+        note: null,
+      } as unknown as Prediction;
+
+      mockPredictionsRepo.findOne.mockResolvedValue(prediction);
+
+      const overLongNote = 'a'.repeat(PREDICTION_NOTE_MAX_LENGTH + 1);
+
+      await expect(
+        service.updateNote('pred-1', { note: overLongNote }, user),
+      ).rejects.toThrow(NoteTooLongException);
+      expect(mockPredictionsRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('should accept a note whose length is only over the limit due to markup that gets stripped', async () => {
+      const user = makeUser();
+      const market = makeMarket();
+      const prediction = {
+        id: 'pred-1',
+        user,
+        market,
+        chosen_outcome: 'Yes',
+        note: null,
+      } as unknown as Prediction;
+
+      mockPredictionsRepo.findOne.mockResolvedValue(prediction);
+      mockPredictionsRepo.save.mockImplementation((entity: Prediction) =>
+        Promise.resolve(entity),
+      );
+
+      const plainText = 'a'.repeat(PREDICTION_NOTE_MAX_LENGTH);
+      const noteWithMarkup = `<b>${plainText}</b>`;
+
+      const result = await service.updateNote(
+        'pred-1',
+        { note: noteWithMarkup },
+        user,
+      );
+
+      expect(result.note).toBe(plainText);
+      expect(result.note?.length).toBe(PREDICTION_NOTE_MAX_LENGTH);
     });
   });
 
