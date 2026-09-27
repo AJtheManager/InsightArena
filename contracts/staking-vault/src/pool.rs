@@ -48,6 +48,23 @@ pub fn distribute(_env: &Env, pool: &mut PoolState, amount: i128) -> Result<(), 
     Ok(())
 }
 
+/// Route a penalty amount into the reward pool for distribution across
+/// `total_shares`.
+///
+/// This is a thin, explicitly-named wrapper around [`distribute`] so that
+/// penalty routing shares the exact same zero-shares semantics: when
+/// `total_shares == 0` the amount is parked in `pending_rewards` (never
+/// divided by zero) and is folded back into the accumulator once a new
+/// staker joins the pool. With a nonzero `total_shares` the amount is
+/// distributed proportionally to existing positions via the accumulator.
+pub fn route_penalty_to_pool(
+    env: &Env,
+    pool: &mut PoolState,
+    amount: i128,
+) -> Result<(), StakingError> {
+    distribute(env, pool, amount)
+}
+
 /// Compute the rewards currently claimable by a position.
 pub fn pending(pool: &PoolState, position: &Position) -> Result<i128, StakingError> {
     let accrued = position
