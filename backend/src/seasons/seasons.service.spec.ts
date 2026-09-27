@@ -1075,5 +1075,132 @@ describe('SeasonsService', () => {
       expect(result.matches).toBe(true);
       expect(result.totalDistributed).toBe('100');
     });
+
+    it('after a partial failure, identifies only the recipients still missing a confirmed payout', async () => {
+      const succeededEntry = {
+        id: 'ledger-succeeded',
+        amount_stroops: '60',
+        status: DistributionLedgerStatus.SUCCEEDED,
+        recipient_stellar_address: 'GSUCCEEDED',
+      };
+      const failedEntry = {
+        id: 'ledger-failed',
+        amount_stroops: '30',
+        status: DistributionLedgerStatus.FAILED,
+        recipient_stellar_address: 'GFAILED',
+      };
+      const pendingEntry = {
+        id: 'ledger-pending',
+        amount_stroops: '10',
+        status: DistributionLedgerStatus.PENDING,
+        recipient_stellar_address: 'GPENDING',
+      };
+      distributionLedgerRepository.find.mockResolvedValue([
+        succeededEntry,
+        failedEntry,
+        pendingEntry,
+      ]);
+
+      const result = await service.reconcileSeasonDistribution(
+        'season-1',
+        100n,
+      );
+
+      // Distributed total reflects only the SUCCEEDED row, so a partial
+      // failure is correctly flagged as a mismatch...
+      expect(result.matches).toBe(false);
+      expect(result.totalDistributed).toBe('60');
+      // ...but the season isn't re-flagged as wholesale undistributed: the
+      // succeeded recipient is excluded from what's still owed.
+      expect(result.missingRecipients).toHaveLength(2);
+      expect(result.missingRecipients).toEqual(
+        expect.arrayContaining([failedEntry, pendingEntry]),
+      );
+      expect(result.missingRecipients).not.toContainEqual(succeededEntry);
+    });
+
+    it('reports no missing recipients and a match for a season with fully confirmed payouts (no-op)', async () => {
+      distributionLedgerRepository.find.mockResolvedValue([
+        { amount_stroops: '100', status: DistributionLedgerStatus.SUCCEEDED },
+      ]);
+
+      const result = await service.reconcileSeasonDistribution(
+        'season-1',
+        100n,
+      );
+
+      expect(result.matches).toBe(true);
+      expect(result.missingRecipients).toEqual([]);
+    });
+
+    it('reports every recipient as missing when nothing has succeeded yet', async () => {
+      distributionLedgerRepository.find.mockResolvedValue([
+        { amount_stroops: '100', status: DistributionLedgerStatus.PENDING },
+      ]);
+
+      const result = await service.reconcileSeasonDistribution(
+        'season-1',
+        100n,
+      );
+
+      expect(result.matches).toBe(false);
+      expect(result.totalDistributed).toBe('0');
+      expect(result.missingRecipients).toHaveLength(1);
+    });
+  });
+
+  describe('reconcileSeasonDistribution does not cause a re-pay of a succeeded recipient', () => {
+    it('re-running computeSeasonRewards after a successful payout does not create a new ledger row or re-notify', async () => {
+      const winner = {
+        id: 'winner-1',
+        username: 'winner',
+        stellar_address: 'GWINNER',
+        season_points: 10,
+      } as Season['top_winner'];
+      const season: Season = {
+        id: 'season-1',
+        season_number: 1,
+        name: 'Season 1',
+        starts_at: new Date('2020-01-01T00:00:00.000Z'),
+        ends_at: new Date('2020-06-01T00:00:00.000Z'),
+        reward_pool_stroops: '100',
+        is_active: false,
+        is_finalized: true,
+        participant_count: 0,
+        top_winner: winner,
+        on_chain_season_id: null,
+        soroban_tx_hash: null,
+        rollover_processed_at: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+
+      // Simulate a prior successful run: the ledger already has a SUCCEEDED
+      // row for this recipient.
+      distributionLedgerRepository.findOne.mockResolvedValue({
+        id: 'ledger-1',
+        status: DistributionLedgerStatus.SUCCEEDED,
+      });
+      distributionLedgerRepository.find.mockResolvedValue([
+        {
+          id: 'ledger-1',
+          amount_stroops: '100',
+          status: DistributionLedgerStatus.SUCCEEDED,
+          recipient_stellar_address: 'GWINNER',
+        },
+      ]);
+
+      const rewardsResult = await service.computeSeasonRewards(season);
+      const reconcileResult = await service.reconcileSeasonDistribution(
+        season.id,
+        100n,
+      );
+
+      expect(rewardsResult).toBe(true);
+      expect(distributionLedgerRepository.save).not.toHaveBeenCalled();
+      expect(notificationsService.create).not.toHaveBeenCalled();
+      expect(reconcileResult.matches).toBe(true);
+      expect(reconcileResult.missingRecipients).toEqual([]);
+    });
   });
 });
