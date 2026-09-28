@@ -671,17 +671,36 @@ export class SeasonsService {
   /**
    * Sums SUCCEEDED ledger rows for a season and compares to its reward
    * pool, logging a mismatch instead of failing silently.
+   *
+   * Also identifies exactly which ledger rows are still missing a confirmed
+   * (SUCCEEDED) payout - i.e. any PENDING or FAILED row - rather than
+   * re-flagging the whole season as undistributed on a partial failure. A
+   * SUCCEEDED row is never included in `missingRecipients`, so re-running
+   * reconciliation after a retry (via computeSeasonRewards, which is itself
+   * idempotent per recipient) correctly narrows to only what's still owed.
+   * A season whose ledger rows are all SUCCEEDED and whose total matches the
+   * pool reports `matches: true` and an empty `missingRecipients`, i.e. a
+   * no-op requiring no further action.
    */
   async reconcileSeasonDistribution(
     seasonId: string,
     pool: bigint,
-  ): Promise<{ matches: boolean; totalDistributed: string }> {
-    const succeeded = await this.distributionLedgerRepository.find({
-      where: {
-        season: { id: seasonId },
-        status: DistributionLedgerStatus.SUCCEEDED,
-      },
+  ): Promise<{
+    matches: boolean;
+    totalDistributed: string;
+    missingRecipients: SeasonDistributionLedgerEntry[];
+  }> {
+    const allEntries = await this.distributionLedgerRepository.find({
+      where: { season: { id: seasonId } },
     });
+
+    const succeeded = allEntries.filter(
+      (entry) => entry.status === DistributionLedgerStatus.SUCCEEDED,
+    );
+    const missingRecipients = allEntries.filter(
+      (entry) => entry.status !== DistributionLedgerStatus.SUCCEEDED,
+    );
+
     const totalDistributed = succeeded.reduce(
       (sum, entry) => sum + BigInt(entry.amount_stroops),
       0n,
@@ -689,10 +708,14 @@ export class SeasonsService {
     const matches = totalDistributed === pool;
     if (!matches) {
       this.logger.error(
-        `Season ${seasonId} distribution mismatch: distributed=${totalDistributed.toString()} pool=${pool.toString()}`,
+        `Season ${seasonId} distribution mismatch: distributed=${totalDistributed.toString()} pool=${pool.toString()} missing=${missingRecipients.length}`,
       );
     }
-    return { matches, totalDistributed: totalDistributed.toString() };
+    return {
+      matches,
+      totalDistributed: totalDistributed.toString(),
+      missingRecipients,
+    };
   }
 
   async getDistributionLedger(

@@ -22,7 +22,11 @@ import {
   BatchPredictionResultDto,
   BatchSubmitResponseDto,
 } from './dto/batch-submit-response.dto';
-import { UpdatePredictionNoteDto } from './dto/update-prediction-note.dto';
+import {
+  PREDICTION_NOTE_MAX_LENGTH,
+  UpdatePredictionNoteDto,
+} from './dto/update-prediction-note.dto';
+import { sanitizePlainText } from '../common/text-sanitizer.util';
 import {
   ListMarketPredictionsDto,
   MarketPredictionResponseDto,
@@ -60,6 +64,7 @@ import {
   BatchSizeExceededException,
   BatchValidationFailedException,
   BatchChainSubmissionFailedException,
+  NoteTooLongException,
 } from './exceptions';
 
 const STROOPS_PER_XLM = 10_000_000n;
@@ -698,6 +703,15 @@ export class PredictionsService {
   /**
    * Update the personal note on a prediction.
    * Only the prediction owner can update their note.
+   *
+   * The note is sanitized (HTML tags and control characters stripped) before
+   * the length check and persistence, so a payload that only exceeds the
+   * limit once markup is counted isn't rejected, and so stored-XSS via
+   * unsanitized markup is never written to the database. This is
+   * defense-in-depth alongside the DTO's own `@Transform`/`@MaxLength`,
+   * since this method is also called directly in tests and could be called
+   * from other server-side call sites that bypass the HTTP validation
+   * pipeline entirely.
    */
   async updateNote(
     predictionId: string,
@@ -713,7 +727,15 @@ export class PredictionsService {
       throw new PredictionNotFoundException(predictionId);
     }
 
-    prediction.note = dto.note;
+    const sanitizedNote = sanitizePlainText(dto.note);
+    if (sanitizedNote.length > PREDICTION_NOTE_MAX_LENGTH) {
+      throw new NoteTooLongException(
+        sanitizedNote.length,
+        PREDICTION_NOTE_MAX_LENGTH,
+      );
+    }
+
+    prediction.note = sanitizedNote;
     return this.predictionsRepository.save(prediction);
   }
 
