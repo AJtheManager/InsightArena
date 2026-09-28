@@ -7,6 +7,7 @@ import {
   Address,
   Contract,
   nativeToScVal,
+  scValToNative,
   Networks,
   Transaction,
 } from '@stellar/stellar-sdk';
@@ -142,6 +143,24 @@ export interface SorobanDisputeResult {
   dispute_id: string;
   tx_hash: string;
 }
+
+/**
+ * Snapshot of the contract's `Dispute` record as returned by
+ * `get_dispute(market_id)`. The contract keys disputes by market, so the
+ * market's on-chain ID is also the dispute's canonical on-chain ID.
+ */
+export interface SorobanOnChainDispute {
+  dispute_id: string;
+  disputer: string;
+  bond: string;
+  filed_at: number;
+  appeal_tier: number;
+  is_resolved: boolean;
+  resolution_upheld: boolean | null;
+}
+
+/** `InsightArenaError::DisputeNotFound` in contracts/open-market/src/errors.rs. */
+const CONTRACT_ERROR_DISPUTE_NOT_FOUND = 62;
 
 export interface SorobanFinalizeEventResult {
   tx_hash: string;
@@ -552,8 +571,10 @@ export class SorobanService {
         `raiseDispute signed by server: ${serverKeypair.publicKey()}`,
       );
 
-      // Generate dispute ID and transaction hash
-      const dispute_id = `dispute_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      // The contract stores one dispute per market under
+      // DataKey::Dispute(market_id), so the market ID is the dispute's
+      // canonical on-chain ID.
+      const dispute_id = marketOnChainId;
       const tx_hash = Buffer.from(
         `dispute:${marketOnChainId}:${dispute_id}:${Date.now()}`,
       )
@@ -565,6 +586,75 @@ export class SorobanService {
         `raiseDispute submitted: dispute_id=${dispute_id} tx_hash=${tx_hash}`,
       );
       return Promise.resolve({ dispute_id, tx_hash });
+    });
+  }
+
+  /**
+   * Read the contract's dispute record for a market via a read-only
+   * simulation of `get_dispute(market_id)`. Returns `null` when the contract
+   * reports `DisputeNotFound`; any other failure (RPC outage, malformed
+   * response, other contract error) is thrown so callers never mistake an
+   * unreachable chain for a missing dispute.
+   */
+  async getDispute(
+    marketOnChainId: string,
+  ): Promise<SorobanOnChainDispute | null> {
+    return this.withSorobanErrorHandling('getDispute', async () => {
+      if (!this.contractId) {
+        throw new Error('SOROBAN_CONTRACT_ID is not configured');
+      }
+
+      const contract = new Contract(this.contractId);
+      // Simulation needs no real source account or signature.
+      const source = new SorobanRpc.Account(Keypair.random().publicKey(), '0');
+      const tx = new TransactionBuilder(source, {
+        fee: '100',
+        networkPassphrase:
+          this.network === 'testnet' ? Networks.TESTNET : Networks.PUBLIC,
+      })
+        .addOperation(
+          contract.call(
+            'get_dispute',
+            nativeToScVal(BigInt(marketOnChainId), { type: 'u64' }),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const simulation = await this.callRpc(
+        `getDispute(${marketOnChainId}):simulateTransaction`,
+        () => this.rpcServer.simulateTransaction(tx),
+      );
+
+      if (SorobanRpc.Api.isSimulationError(simulation)) {
+        if (
+          simulation.error.includes(
+            `Error(Contract, #${CONTRACT_ERROR_DISPUTE_NOT_FOUND})`,
+          )
+        ) {
+          return null;
+        }
+        throw new Error(`get_dispute simulation failed: ${simulation.error}`);
+      }
+
+      const retval = simulation.result?.retval;
+      if (!retval) {
+        throw new Error('get_dispute simulation returned no value');
+      }
+
+      const raw = scValToNative(retval) as Record<string, unknown>;
+      return {
+        dispute_id: marketOnChainId,
+        disputer: String(raw.disputer ?? ''),
+        bond: String(raw.bond ?? '0'),
+        filed_at: Number(raw.filed_at ?? 0),
+        appeal_tier: Number(raw.appeal_tier ?? 0),
+        is_resolved: raw.is_resolved === true,
+        resolution_upheld:
+          typeof raw.resolution_upheld === 'boolean'
+            ? raw.resolution_upheld
+            : null,
+      };
     });
   }
 
