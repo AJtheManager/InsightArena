@@ -72,6 +72,22 @@ class EnvironmentVariables {
   @IsNumber()
   EXPORT_TTL_HOURS: number = 48;
 
+  @IsOptional()
+  @IsString()
+  EXPORT_CLEANUP_ENABLED?: string;
+
+  @IsString()
+  EXPORT_CLEANUP_CRON: string = '0 * * * *';
+
+  @IsNumber()
+  EXPORT_FAILED_RETENTION_HOURS: number = 24;
+
+  @IsNumber()
+  EXPORT_STUCK_PROCESSING_MINUTES: number = 60;
+
+  @IsNumber()
+  EXPORT_ORPHAN_GRACE_MINUTES: number = 60;
+
   @IsString()
   LEADERBOARD_SNAPSHOT_CRON: string = '0 * * * *';
 
