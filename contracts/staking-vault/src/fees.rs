@@ -43,6 +43,15 @@ pub fn deposit_fees(env: &Env, from: Address, amount: i128) -> Result<(), Stakin
 }
 
 /// Route early-exit penalty into the reward pool using checked arithmetic.
+///
+/// When the pool has zero total shares (e.g. every staker has withdrawn), the
+/// penalty cannot be divided across positions. In that case it is parked as
+/// pending rewards so it is not lost and becomes recoverable once a new staker
+/// joins the pool. This mirrors the zero-shares behavior of `deposit_fees`
+/// (`test_deposit_fees_with_zero_shares_parks_in_pending_rewards`).
+///
+/// With a nonzero `total_shares`, the penalty is distributed proportionally to
+/// existing positions via [`pool::distribute`].
 pub fn route_penalty_to_pool(env: &Env, penalty_amount: i128) -> Result<(), StakingError> {
     if penalty_amount <= 0 {
         return Ok(());
@@ -54,7 +63,17 @@ pub fn route_penalty_to_pool(env: &Env, penalty_amount: i128) -> Result<(), Stak
         .get::<DataKey, PoolState>(&DataKey::Pool)
         .ok_or(StakingError::NotInitialized)?;
 
-    pool::distribute(env, &mut pool_state, penalty_amount)?;
+    if pool_state.total_shares == 0 {
+        // No positions to divide across: park the penalty as pending rewards
+        // instead of dividing by zero. It is folded into the pool once a new
+        // staker joins (see `pool::distribute`).
+        pool_state.pending_rewards = pool_state
+            .pending_rewards
+            .checked_add(penalty_amount)
+            .ok_or(StakingError::Overflow)?;
+    } else {
+        pool::distribute(env, &mut pool_state, penalty_amount)?;
+    }
 
     env.storage().instance().set(&DataKey::Pool, &pool_state);
 
