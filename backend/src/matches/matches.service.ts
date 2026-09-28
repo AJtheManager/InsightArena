@@ -106,7 +106,10 @@ export class MatchesService {
       total_predictions: totalPredictions,
     };
 
-    if (includeUsers) {
+    if (includeUsers && totalPredictions === 0) {
+      response.users = [];
+      response.meta = { total: 0, page, limit, totalPages: 0 };
+    } else if (includeUsers) {
       const skip = (page - 1) * limit;
       const [predictions, total] =
         await this.matchPredictionRepository.findAndCount({
@@ -136,32 +139,49 @@ export class MatchesService {
     return response;
   }
 
-  private async getDistribution(matchId: string, totalPredictions: number) {
-    const outcomes = ['TEAM_A', 'TEAM_B', 'DRAW'] as const;
-    const distribution: Array<{
-      outcome: string;
-      count: number;
-      percentage: string;
-    }> = [];
+  private static readonly DISTRIBUTION_OUTCOMES: readonly PredictedOutcome[] =
+    [PredictedOutcome.TEAM_A, PredictedOutcome.TEAM_B, PredictedOutcome.DRAW];
 
-    for (const outcome of outcomes) {
-      const count = await this.matchPredictionRepository.count({
-        where: {
-          match: { id: matchId },
-          predicted_outcome: outcome as PredictedOutcome,
-        },
-      });
-      distribution.push({
+  /**
+   * Build the per-outcome prediction distribution for a match. Always returns
+   * one entry per outcome in a stable order (TEAM_A, TEAM_B, DRAW). For
+   * matches with no predictions, returns zeroed entries without querying the
+   * database, so percentages are never computed from a zero denominator.
+   */
+  private async getDistribution(
+    matchId: string,
+    totalPredictions: number,
+  ): Promise<Array<{ outcome: string; count: number; percentage: string }>> {
+    const outcomes = MatchesService.DISTRIBUTION_OUTCOMES;
+
+    if (!(totalPredictions > 0)) {
+      return outcomes.map((outcome) => ({
         outcome,
-        count,
-        percentage:
-          totalPredictions > 0
-            ? ((count / totalPredictions) * 100).toFixed(2)
-            : '0.00',
-      });
+        count: 0,
+        percentage: '0.00',
+      }));
     }
 
-    return distribution;
+    const rows = await this.matchPredictionRepository
+      .createQueryBuilder('prediction')
+      .select('prediction.predicted_outcome', 'outcome')
+      .addSelect('COUNT(*)', 'count')
+      .where('prediction.match_id = :matchId', { matchId })
+      .groupBy('prediction.predicted_outcome')
+      .getRawMany<{ outcome: PredictedOutcome; count: string | number }>();
+
+    const counts = new Map<string, number>(
+      rows.map((row) => [row.outcome, Number(row.count) || 0]),
+    );
+
+    return outcomes.map((outcome) => {
+      const count = counts.get(outcome) ?? 0;
+      return {
+        outcome,
+        count,
+        percentage: ((count / totalPredictions) * 100).toFixed(2),
+      };
+    });
   }
 
   /**
