@@ -6,7 +6,7 @@ use crate::escrow;
 use crate::market;
 use crate::storage_types::{
     DataKey, FeeTier, FeeTierConfig, LPPosition, LiquidityPool, Market, MarketFeeInfo,
-    PriceAccumulator, PriceObservation, SwapRecord, VolatilityState,
+    PriceAccumulator, PriceObservation, SwapRecord, VolatilityState, VolumeFeeConfig,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -142,6 +142,26 @@ pub fn fee_bps_for_tier(tier: &FeeTier, cfg: &FeeTierConfig) -> u32 {
     }
 }
 
+/// Select the volume-based fee tier for a market given its cumulative volume.
+/// Returns the index into `VolumeFeeConfig::tiers` and the corresponding fee bps.
+/// The last tier whose threshold is ≤ `cumulative_volume` is chosen.
+pub fn select_volume_fee_tier(cumulative_volume: i128, config: &VolumeFeeConfig) -> (u32, u32) {
+    let mut active_idx: u32 = 0;
+    let mut active_fee_bps = config.tiers.get(0).map(|t| t.fee_bps).unwrap_or(30);
+
+    for i in 1..config.tiers.len() {
+        let entry = config.tiers.get(i).unwrap();
+        if cumulative_volume >= entry.volume_threshold {
+            active_idx = i;
+            active_fee_bps = entry.fee_bps;
+        } else {
+            break;
+        }
+    }
+
+    (active_idx, active_fee_bps)
+}
+
 fn validate_fee_tier_config(cfg: &FeeTierConfig) -> Result<(), InsightArenaError> {
     if cfg.calm_threshold_bps >= cfg.volatile_threshold_bps {
         return Err(InsightArenaError::InvalidInput);
@@ -196,6 +216,7 @@ pub fn set_fee_tier_config(
     admin: Address,
     new_config: FeeTierConfig,
 ) -> Result<(), InsightArenaError> {
+    config::ensure_not_paused(env)?;
     admin.require_auth();
 
     let cfg = config::get_config(env)?;
@@ -265,20 +286,28 @@ fn update_volatility_state(
     Ok(state)
 }
 
-/// Return the current dynamic fee tier and effective swap fee for a market.
+/// Return the current dynamic fee state for a market.
+/// `effective_fee_bps` reflects the volume-based fee tier active for this
+/// market's cumulative volume. Volatility-tier info (`tier`, `volatility_ema_bps`)
+/// is provided for informational / off-chain analysis.
 pub fn get_market_fee_info(env: &Env, market_id: u64) -> Result<MarketFeeInfo, InsightArenaError> {
-    market::get_market(env, market_id)?;
+    let mkt = market::get_market(env, market_id)?;
 
     let tier_config = get_fee_tier_config(env);
     let volatility = get_volatility_state(env, market_id);
     let tier = determine_fee_tier(volatility.ema_bps, &tier_config);
-    let effective_fee_bps = fee_bps_for_tier(&tier, &tier_config);
+
+    let cfg = config::get_config(env)?;
+    let (volume_tier_index, effective_fee_bps) =
+        select_volume_fee_tier(mkt.cumulative_volume, &cfg.volume_fee_config);
 
     Ok(MarketFeeInfo {
         market_id,
         tier,
         effective_fee_bps,
         volatility_ema_bps: volatility.ema_bps,
+        volume_tier_index,
+        volume_tier_fee_bps: effective_fee_bps,
     })
 }
 
@@ -357,21 +386,60 @@ fn record_price_observation(
 /// its price for the remainder, then compared against the integral extrapolated
 /// to now. See `TWAP_RING_BUFFER_CAPACITY` for the max window the ring buffer
 /// can currently honor.
+///
+/// # Safety Validations
+///
+/// This function implements comprehensive safety checks to prevent numerical
+/// instability and ensure accurate TWAP calculations:
+///
+/// 1. **Zero-window rejection** (`TwapEmptyWindow`): A zero-second window cannot
+///    produce a meaningful time-weighted average — the integral would be empty.
+///
+/// 2. **History coverage validation** (`TwapInsufficientHistory`): Rejects requests
+///    when the ring buffer doesn't retain observations covering the requested window.
+///    This occurs when:
+///    - No price observations have been recorded yet (`total_count == 0`)
+///    - The window reaches back before the oldest retained observation
+///      (observations were evicted due to ring buffer wraparound)
+///
+/// 3. **Divide-by-zero protection** (`TwapDivideByZero`): Prevents division by zero
+///    when the elapsed time collapses to zero seconds, which can happen at ledger
+///    timestamp 0 when `now - window_start` saturates to zero.
+///
+/// These validations ensure TWAP reads fail safely on invalid inputs rather than
+/// returning misleading averages or causing arithmetic traps.
+///
+/// # Errors
+///
+/// - [`InsightArenaError::TwapEmptyWindow`] — `window` is zero.
+/// - [`InsightArenaError::InvalidOutcome`] — `outcome` is not in the pool's reserves.
+/// - [`InsightArenaError::TwapInsufficientHistory`] — No observations recorded yet,
+///   or the requested window predates the oldest retained observation.
+/// - [`InsightArenaError::TwapDivideByZero`] — Elapsed time collapsed to zero seconds.
+/// - [`InsightArenaError::Overflow`] — Arithmetic overflow in cumulative calculation.
 pub fn get_twap(
     env: &Env,
     market_id: u64,
     outcome: Symbol,
     window: u64,
 ) -> Result<i128, InsightArenaError> {
+    // ── Validation 1: Reject zero-second windows ─────────────────────────────
+    // A zero-second window is logically empty and cannot produce a meaningful
+    // time-weighted average. Reject this immediately before any storage access.
     if window == 0 {
         return Err(InsightArenaError::TwapEmptyWindow);
     }
 
+    // ── Load pool and validate outcome exists ─────────────────────────────────
     let pool = get_pool(env, market_id)?;
     if pool.outcome_reserves.get(outcome.clone()).is_none() {
         return Err(InsightArenaError::InvalidOutcome);
     }
 
+    // ── Validation 2: Check price accumulator exists and has history ─────────
+    // The price accumulator must exist and contain at least one observation.
+    // If `total_count == 0`, no price-changing operations have occurred yet,
+    // so there is no history to average over.
     let acc = pool
         .price_accumulators
         .get(outcome)
@@ -383,7 +451,13 @@ pub fn get_twap(
     let now = env.ledger().timestamp();
     let window_start = now.saturating_sub(window);
 
-    // Latest retained observation at or before `window_start`.
+    // ── Validation 3: Ensure ring buffer covers the requested window ─────────
+    // Find the latest retained observation at or before `window_start`. If no
+    // such observation exists, the ring buffer has wrapped and evicted older
+    // observations — the window reaches back beyond our retained history.
+    // Rather than silently truncating the window (which would produce a
+    // misleading average over a shorter interval than requested), we reject
+    // the query with `TwapInsufficientHistory`.
     let mut before: Option<PriceObservation> = None;
     for obs in acc.observations.iter() {
         if obs.timestamp <= window_start {
@@ -398,6 +472,9 @@ pub fn get_twap(
     }
     let before = before.ok_or(InsightArenaError::TwapInsufficientHistory)?;
 
+    // ── Compute cumulative price integral at window start ────────────────────
+    // Extrapolate from the observation at or before `window_start` using its
+    // price for the elapsed time since that observation.
     let cumulative_start = before
         .price
         .checked_mul((window_start - before.timestamp) as i128)
@@ -405,6 +482,8 @@ pub fn get_twap(
         .checked_add(before.price_cumulative)
         .ok_or(InsightArenaError::Overflow)?;
 
+    // ── Compute cumulative price integral at now ─────────────────────────────
+    // Extrapolate from the last recorded timestamp using the current price.
     let cumulative_now = acc
         .last_price
         .checked_mul((now - acc.last_timestamp) as i128)
@@ -412,11 +491,18 @@ pub fn get_twap(
         .checked_add(acc.cumulative)
         .ok_or(InsightArenaError::Overflow)?;
 
+    // ── Validation 4: Prevent division by zero ───────────────────────────────
+    // Compute the actual elapsed time over the window. If this collapses to
+    // zero (e.g., at ledger timestamp 0 when `saturating_sub` clamps both
+    // `now` and `window_start` to 0), dividing the price delta by elapsed
+    // would trap. Reject this case explicitly.
     let elapsed = now.saturating_sub(window_start);
     if elapsed == 0 {
         return Err(InsightArenaError::TwapDivideByZero);
     }
 
+    // ── Compute time-weighted average price ──────────────────────────────────
+    // TWAP = (cumulative_now - cumulative_start) / elapsed
     let twap = cumulative_now
         .checked_sub(cumulative_start)
         .ok_or(InsightArenaError::Overflow)?
@@ -424,6 +510,26 @@ pub fn get_twap(
         .ok_or(InsightArenaError::Overflow)?;
 
     Ok(twap)
+}
+
+/// Compute the time-weighted average price over the trailing `window_seconds`
+/// for `market_id`'s primary outcome (`Market::outcome_options[0]`).
+///
+/// Convenience entry point for downstream consumers (indexer, UI) that track
+/// a market by a single headline price rather than per-outcome, delegating to
+/// [`get_twap`] for the actual accumulator math. Markets with more than one
+/// outcome still have their other outcomes queryable via `get_twap` directly.
+pub fn get_market_twap(
+    env: &Env,
+    market_id: u64,
+    window_seconds: u64,
+) -> Result<i128, InsightArenaError> {
+    let mkt = market::get_market(env, market_id)?;
+    let outcome = mkt
+        .outcome_options
+        .get(0)
+        .ok_or(InsightArenaError::InvalidOutcome)?;
+    get_twap(env, market_id, outcome, window_seconds)
 }
 
 // ── Impermanent Loss Accounting ───────────────────────────────────────────────
@@ -449,6 +555,24 @@ fn isqrt_u128(n: u128) -> u128 {
     }
     let mut x = n;
     let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
+/// Integer square root (floor) of a non-negative `i128`, via Babylonian
+/// (Newton's) method. Used in the bootstrap branch of `add_liquidity` to
+/// compute `initial_liquidity = floor(sqrt(amount_a * amount_b))`, matching
+/// Uniswap v2's share-inflation defence. Callers must guarantee `n >= 0`;
+/// passing a negative value returns `0` defensively.
+fn isqrt_i128(n: i128) -> i128 {
+    if n <= 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x / 2) + 1;
     while y < x {
         x = y;
         y = (x + n / x) / 2;
@@ -685,10 +809,7 @@ pub fn calculate_lp_tokens(
 /// `Market::outcome_liquidity_cap` override takes precedence over the global
 /// `Config::max_liquidity_per_outcome`. Returns `None` when neither is set
 /// (unlimited).
-fn effective_outcome_cap(
-    env: &Env,
-    market: &Market,
-) -> Result<Option<i128>, InsightArenaError> {
+fn effective_outcome_cap(env: &Env, market: &Market) -> Result<Option<i128>, InsightArenaError> {
     if market.outcome_liquidity_cap > 0 {
         return Ok(Some(market.outcome_liquidity_cap));
     }
@@ -798,6 +919,42 @@ pub fn add_liquidity(
         }
         (lp_tokens, pool)
     } else {
+        // ── Bootstrap: first-depositor share-inflation defence ─────────────
+        //
+        // Minting 1:1 on the very first deposit lets an attacker deposit a
+        // tiny amount, directly donate tokens to inflate the share price, then
+        // siphon subsequent depositors' funds.  We follow Uniswap v2's fix:
+        //
+        //   initial_liquidity = floor(sqrt(amount_a * amount_b))
+        //   lp_tokens_to_mint = initial_liquidity - MIN_LIQUIDITY
+        //
+        // MIN_LIQUIDITY is permanently counted in total_supply but never
+        // credited to any account, making the cost of a donation attack
+        // proportional to MIN_LIQUIDITY rather than 1 stroop.
+        //
+        // For this N-outcome AMM each outcome receives `per_outcome_amount`
+        // (= amount / outcome_count), so amount_a == amount_b ==
+        // per_outcome_amount, and sqrt(a*b) == per_outcome_amount exactly
+        // (perfect square).  We use the general formula so the logic is
+        // correct even if future callers supply unequal amounts.
+        let product = per_outcome_amount
+            .checked_mul(per_outcome_amount)
+            .ok_or(InsightArenaError::Overflow)?;
+        let initial_liquidity = isqrt_i128(product);
+
+        // Reject dust deposits whose geometric mean does not exceed the
+        // minimum lock.  This check MUST precede the subtraction to prevent
+        // an underflow on `initial_liquidity - MIN_LIQUIDITY`.
+        // Reuses `StakeTooLow` — the error enum is at its 50-case XDR cap
+        // and cannot accommodate a new variant.
+        if initial_liquidity <= MIN_LIQUIDITY {
+            return Err(InsightArenaError::StakeTooLow);
+        }
+
+        let lp_tokens_to_mint = initial_liquidity
+            .checked_sub(MIN_LIQUIDITY)
+            .ok_or(InsightArenaError::Overflow)?;
+
         let mut reserves = Map::new(env);
         for outcome in mkt.outcome_options.iter() {
             reserves.set(outcome, per_outcome_amount);
@@ -810,9 +967,12 @@ pub fn add_liquidity(
             env.ledger().timestamp(),
         );
         let mut pool = pool;
-        pool.lp_token_supply = amount;
+        // total_supply = initial_liquidity (includes the permanently-locked
+        // MIN_LIQUIDITY); the depositor's tracked balance is only
+        // lp_tokens_to_mint.
+        pool.lp_token_supply = initial_liquidity;
         pool.total_liquidity = amount;
-        (amount, pool)
+        (lp_tokens_to_mint, pool)
     };
 
     if is_new_pool {
@@ -931,6 +1091,16 @@ pub fn remove_liquidity(
 // ── Trading Functions ─────────────────────────────────────────────────────────
 
 /// Swap from one outcome position to another
+///
+/// `deadline`, if supplied, is a ledger timestamp: the swap reverts with
+/// `MarketExpired` if `env.ledger().timestamp()` is already past it. This
+/// bounds how long a signed transaction can sit unconfirmed (e.g. in a
+/// mempool or awaiting a slow relay) before its slippage guarantee -- based
+/// on reserves at signing time -- becomes stale. Reuses `MarketExpired`
+/// rather than adding a new variant: `#[contracterror]` enums are hard-capped
+/// at 50 XDR cases and this enum is already at that limit (see
+/// `ZeroShareTransfer = 112` in errors.rs) -- both cases represent the same
+/// underlying fact, that the window this trade was valid for has closed.
 pub fn swap_outcome(
     env: &Env,
     trader: Address,
@@ -939,11 +1109,18 @@ pub fn swap_outcome(
     to_outcome: Symbol,
     amount_in: i128,
     min_amount_out: i128,
+    deadline: Option<u64>,
 ) -> Result<i128, InsightArenaError> {
     config::ensure_not_paused(env)?;
 
     if amount_in <= 0 || from_outcome == to_outcome {
         return Err(InsightArenaError::InvalidInput);
+    }
+
+    if let Some(deadline) = deadline {
+        if env.ledger().timestamp() > deadline {
+            return Err(InsightArenaError::MarketExpired);
+        }
     }
 
     let mkt = market::get_market(env, market_id)?;
@@ -962,17 +1139,25 @@ pub fn swap_outcome(
         .get(to_outcome.clone())
         .ok_or(InsightArenaError::InvalidOutcome)?;
 
-    // Fee tier is derived from volatility observed *before* this swap, so a
-    // trade cannot influence the fee rate it itself pays.
+    // ── Volume-based fee tier selection ────────────────────────────────────
+    // The fee is derived from the market's cumulative volume *before* this
+    // swap, so a trade cannot influence the fee rate it itself pays.
+    let cfg = config::get_config(env)?;
+    let volume_before = mkt.cumulative_volume;
+    let (volume_tier_before, effective_fee_bps) =
+        select_volume_fee_tier(volume_before, &cfg.volume_fee_config);
+
+    // Volatility state is still tracked (for informational purposes / TWAP).
     let tier_config = get_fee_tier_config(env);
     let volatility_before = get_volatility_state(env, market_id);
-    let tier = determine_fee_tier(volatility_before.ema_bps, &tier_config);
-    let effective_fee_bps = fee_bps_for_tier(&tier, &tier_config);
 
     let amount_out = calculate_swap_output(amount_in, from_reserve, to_reserve, effective_fee_bps)?;
 
+    // Slippage guard: reject if the computed output falls below the caller's
+    // minimum. See `InsightArenaError::StakeTooLow` for why this reuses that
+    // variant rather than adding a new one (the error enum is at its 50-case cap).
     if amount_out < min_amount_out {
-        return Err(InsightArenaError::InvalidInput);
+        return Err(InsightArenaError::StakeTooLow);
     }
 
     let fee_amount = amount_in
@@ -984,6 +1169,7 @@ pub fn swap_outcome(
     // Split the fee between the protocol treasury and liquidity providers.
     // `lp_fee_share` is derived by subtraction so the two shares always sum
     // to `fee_amount` exactly, with no stroop lost or double-counted.
+    // Protocol share bps is read from the volatility-based FeeTierConfig.
     let protocol_fee_share = fee_amount
         .checked_mul(tier_config.protocol_share_bps as i128)
         .ok_or(InsightArenaError::Overflow)?
@@ -1004,7 +1190,8 @@ pub fn swap_outcome(
 
     pool.outcome_reserves
         .set(from_outcome.clone(), new_from_reserve);
-    pool.outcome_reserves.set(to_outcome.clone(), new_to_reserve);
+    pool.outcome_reserves
+        .set(to_outcome.clone(), new_to_reserve);
     pool.fee_bps = effective_fee_bps;
 
     record_price_observation(env, &mut pool, from_outcome.clone(), new_from_reserve)?;
@@ -1027,7 +1214,6 @@ pub fn swap_outcome(
     // default `treasury_split_bps == 10_000`, so the entire protocol fee
     // share keeps flowing to the treasury exactly as it did before this
     // split was introduced.
-    let cfg = config::get_config(env)?;
     let treasury_amount = protocol_fee_share
         .checked_mul(cfg.treasury_split_bps as i128)
         .ok_or(InsightArenaError::Overflow)?
@@ -1054,6 +1240,31 @@ pub fn swap_outcome(
         total_lp_share,
     );
 
+    // ── Update cumulative market volume and detect tier crossing ─────────────
+    let new_volume = volume_before
+        .checked_add(amount_in)
+        .ok_or(InsightArenaError::Overflow)?;
+
+    let (volume_tier_after, _) = select_volume_fee_tier(new_volume, &cfg.volume_fee_config);
+
+    if volume_tier_after > volume_tier_before {
+        emit_volume_tier_crossed(
+            env,
+            market_id,
+            volume_tier_before,
+            volume_tier_after,
+            new_volume,
+        );
+    }
+
+    let mut mkt = mkt;
+    mkt.cumulative_volume = new_volume;
+    env.storage()
+        .persistent()
+        .set(&DataKey::Market(market_id), &mkt);
+    market::bump_market(env, market_id);
+
+    // ── Record swap with volume tier snapshot ────────────────────────────────
     let record = SwapRecord::new(
         trader,
         market_id,
@@ -1063,6 +1274,7 @@ pub fn swap_outcome(
         amount_out,
         fee_amount,
         env.ledger().timestamp(),
+        volume_tier_before,
     );
 
     let mut history: Vec<SwapRecord> = env
@@ -1078,6 +1290,19 @@ pub fn swap_outcome(
     update_pool_volume(env, market_id, amount_in);
 
     Ok(amount_out)
+}
+
+fn emit_volume_tier_crossed(
+    env: &Env,
+    market_id: u64,
+    from_tier: u32,
+    to_tier: u32,
+    cumulative_volume: i128,
+) {
+    env.events().publish(
+        (symbol_short!("vol"), symbol_short!("tier_x")),
+        (market_id, from_tier, to_tier, cumulative_volume),
+    );
 }
 
 /// Emit an event recording exactly how a swap's collected fee was split
@@ -1223,6 +1448,7 @@ pub fn collect_lp_fees(
     provider: Address,
     market_id: u64,
 ) -> Result<i128, InsightArenaError> {
+    config::ensure_not_paused(env)?;
     provider.require_auth();
 
     let mut position = get_lp_position(env, &provider, market_id)?;

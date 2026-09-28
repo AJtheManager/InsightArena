@@ -7,7 +7,7 @@ import {
   BadRequestException,
   ForbiddenException,
 } from '@nestjs/common';
-import { DisputesService } from './disputes.service';
+import { DisputesService, MAX_TIER } from './disputes.service';
 import {
   Dispute,
   DisputeStatus,
@@ -15,6 +15,7 @@ import {
   DisputeSlaStage,
 } from './entities/dispute.entity';
 import { DisputeEvidence } from './entities/dispute-evidence.entity';
+import { DisputeVote } from './entities/dispute-vote.entity';
 import { Market } from '../markets/entities/market.entity';
 import { User } from '../users/entities/user.entity';
 import { SorobanService } from '../soroban/soroban.service';
@@ -29,6 +30,7 @@ describe('DisputesService', () => {
   let disputesRepository: Repository<Dispute>;
   let marketsRepository: Repository<Market>;
   let evidenceRepository: Repository<DisputeEvidence>;
+  let votesRepository: Repository<DisputeVote>;
   let usersRepository: Repository<User>;
   let sorobanService: SorobanService;
   let notificationGenerator: jest.Mocked<NotificationGeneratorService>;
@@ -86,6 +88,7 @@ describe('DisputesService', () => {
             findAndCount: jest.fn(),
             find: jest.fn(),
             update: jest.fn(),
+            createQueryBuilder: jest.fn(),
           },
         },
         {
@@ -100,6 +103,15 @@ describe('DisputesService', () => {
             create: jest.fn(),
             save: jest.fn(),
             find: jest.fn(),
+          },
+        },
+        {
+          provide: getRepositoryToken(DisputeVote),
+          useValue: {
+            findOne: jest.fn(),
+            create: jest.fn((v: DisputeVote) => v),
+            save: jest.fn((v: DisputeVote) => Promise.resolve(v)),
+            find: jest.fn().mockResolvedValue([]),
           },
         },
         {
@@ -141,6 +153,9 @@ describe('DisputesService', () => {
     );
     evidenceRepository = module.get<Repository<DisputeEvidence>>(
       getRepositoryToken(DisputeEvidence),
+    );
+    votesRepository = module.get<Repository<DisputeVote>>(
+      getRepositoryToken(DisputeVote),
     );
     usersRepository = module.get<Repository<User>>(getRepositoryToken(User));
     sorobanService = module.get<SorobanService>(SorobanService);
@@ -404,46 +419,95 @@ describe('DisputesService', () => {
   });
 
   describe('findAll', () => {
-    it('should return paginated disputes', async () => {
-      const disputes = [mockDispute];
-      const mockFindAndCount = [disputes, 1];
-      jest
-        .spyOn(disputesRepository, 'findAndCount')
-        .mockResolvedValue(mockFindAndCount);
+    const makeDispute = (
+      id: string,
+      createdAt: Date,
+      status = DisputeStatus.PENDING,
+    ): Dispute => ({ ...mockDispute, id, createdAt, status }) as Dispute;
 
-      const result = await service.findAll(1, 20);
+    /** Builds a chainable queryBuilder mock; `getMany` resolves to `rows`. */
+    const mockQueryBuilder = (
+      rows: Dispute[],
+      countRows: Array<{ status: DisputeStatus; count: string }> = [],
+    ) => {
+      const qb: any = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        addSelect: jest.fn().mockReturnThis(),
+        groupBy: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(rows),
+        getRawMany: jest.fn().mockResolvedValue(countRows),
+      };
+      return qb;
+    };
 
-      expect(result).toEqual({
-        disputes,
-        total: 1,
-        page: 1,
+    it('narrows results when filtering by status', async () => {
+      const pending = makeDispute('d1', new Date('2024-01-02T00:00:00Z'));
+      const qb = mockQueryBuilder(
+        [pending],
+        [{ status: DisputeStatus.PENDING, count: '1' }],
+      );
+      jest.spyOn(disputesRepository, 'createQueryBuilder').mockReturnValue(qb);
+
+      const result = await service.findAll({
+        status: DisputeStatus.PENDING,
         limit: 20,
+      } as any);
+
+      expect(qb.andWhere).toHaveBeenCalledWith('dispute.status = :status', {
+        status: DisputeStatus.PENDING,
       });
-      expect(disputesRepository.findAndCount).toHaveBeenCalledWith({
-        where: {},
-        relations: ['market', 'disputant', 'resolvedBy'],
-        order: { createdAt: 'DESC' },
-        skip: 0,
-        take: 20,
-      });
+      expect(result.disputes).toEqual([pending]);
+      expect(result.counts_by_status).toEqual({ pending: 1, resolved: 0 });
     });
 
-    it('should filter by status', async () => {
-      const disputes = [mockDispute];
-      const mockFindAndCount = [disputes, 1];
-      jest
-        .spyOn(disputesRepository, 'findAndCount')
-        .mockResolvedValue(mockFindAndCount);
+    it('paginates stably via cursor, requesting one extra row to detect more pages', async () => {
+      const rows = [
+        makeDispute('d3', new Date('2024-01-03T00:00:00Z')),
+        makeDispute('d2', new Date('2024-01-02T00:00:00Z')),
+        makeDispute('d1', new Date('2024-01-01T00:00:00Z')),
+      ];
+      const qb = mockQueryBuilder(rows);
+      jest.spyOn(disputesRepository, 'createQueryBuilder').mockReturnValue(qb);
 
-      await service.findAll(1, 20, DisputeStatus.PENDING);
+      const result = await service.findAll({ limit: 2 } as any);
 
-      expect(disputesRepository.findAndCount).toHaveBeenCalledWith({
-        where: { status: DisputeStatus.PENDING },
-        relations: ['market', 'disputant', 'resolvedBy'],
-        order: { createdAt: 'DESC' },
-        skip: 0,
-        take: 20,
-      });
+      expect(qb.take).toHaveBeenCalledWith(3);
+      expect(result.disputes).toHaveLength(2);
+      expect(result.has_more).toBe(true);
+      expect(result.next_cursor).toBeTruthy();
+    });
+
+    it('applies the decoded cursor as a strict less-than filter on createdAt/id', async () => {
+      const rows = [makeDispute('d1', new Date('2024-01-01T00:00:00Z'))];
+      const qb = mockQueryBuilder(rows);
+      jest.spyOn(disputesRepository, 'createQueryBuilder').mockReturnValue(qb);
+
+      const cursor = Buffer.from(
+        '2024-01-02T00:00:00.000Z:d2',
+        'utf-8',
+      ).toString('base64');
+
+      const result = await service.findAll({ cursor, limit: 20 } as any);
+
+      expect(qb.andWhere).toHaveBeenCalledWith(
+        expect.stringContaining('dispute.createdAt < :cursorCreatedAt'),
+        expect.objectContaining({ cursorId: 'd2' }),
+      );
+      expect(result.disputes).toEqual(rows);
+    });
+
+    it('rejects a malformed cursor', async () => {
+      await expect(
+        service.findAll({
+          cursor: 'not-valid-base64-cursor!!',
+          limit: 20,
+        } as any),
+      ).rejects.toThrow(BadRequestException);
     });
   });
 
@@ -704,7 +768,11 @@ describe('DisputesService', () => {
       jest.spyOn(usersRepository, 'findOne').mockResolvedValue(null);
 
       await expect(
-        service.assignArbiter('dispute-123', 'missing-user', 'requesting-admin'),
+        service.assignArbiter(
+          'dispute-123',
+          'missing-user',
+          'requesting-admin',
+        ),
       ).rejects.toThrow(NotFoundException);
     });
 
@@ -848,9 +916,7 @@ describe('DisputesService', () => {
       expect(dispute.slaStage).toBe(DisputeSlaStage.ESCALATED);
       expect(
         notificationGenerator.notifyDisputeSlaBreached,
-      ).toHaveBeenCalledWith(
-        expect.objectContaining({ escalated: false }),
-      );
+      ).toHaveBeenCalledWith(expect.objectContaining({ escalated: false }));
     });
 
     it('never changes dispute status - SLA tracking is advisory only', async () => {
@@ -864,6 +930,438 @@ describe('DisputesService', () => {
       await service.runSlaCheck();
 
       expect(dispute.status).toBe(DisputeStatus.PENDING);
+    });
+  });
+
+  describe('castVote', () => {
+    const makeVoter = (overrides: Partial<User> = {}): User =>
+      ({
+        id: 'voter-1',
+        stellar_address: 'GVOTER1',
+        reputation_score: 50,
+        ...overrides,
+      }) as User;
+
+    const makePendingTierDispute = (
+      overrides: Partial<Dispute> = {},
+    ): Dispute =>
+      ({
+        id: 'dispute-vote-1',
+        marketId: 'market-123',
+        status: DisputeStatus.PENDING,
+        tier: 1,
+        quorumThreshold: 100,
+        resolution: null,
+        escalatedFromId: null,
+        ...overrides,
+      }) as Dispute;
+
+    const makeVote = (
+      outcome: DisputeResolution,
+      weight: number,
+    ): DisputeVote =>
+      ({
+        outcome,
+        weight,
+        disputeId: 'dispute-vote-1',
+      }) as DisputeVote;
+
+    it('records a reputation-weighted vote and leaves the dispute open below quorum', async () => {
+      const dispute = makePendingTierDispute();
+      const voter = makeVoter({ reputation_score: 40 });
+      jest.spyOn(service, 'findOne').mockResolvedValue(dispute);
+      jest.spyOn(votesRepository, 'findOne').mockResolvedValue(null);
+      // A single 40-weight vote against a quorum of 100.
+      jest
+        .spyOn(votesRepository, 'find')
+        .mockResolvedValue([makeVote(DisputeResolution.OVERTURNED, 40)]);
+      const disputeSaveSpy = jest.spyOn(disputesRepository, 'save');
+
+      await service.castVote(
+        'dispute-vote-1',
+        { outcome: DisputeResolution.OVERTURNED },
+        voter,
+      );
+
+      expect(votesRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          disputeId: 'dispute-vote-1',
+          voterId: 'voter-1',
+          voterAddress: 'GVOTER1',
+          outcome: DisputeResolution.OVERTURNED,
+          weight: 40,
+          tier: 1,
+        }),
+      );
+      // Below quorum: the tier is not finalized.
+      expect(disputeSaveSpy).not.toHaveBeenCalled();
+    });
+
+    it('finalizes to the weighted-majority outcome once quorum is met', async () => {
+      const dispute = makePendingTierDispute({ quorumThreshold: 100 });
+      const voter = makeVoter({ reputation_score: 60 });
+      jest.spyOn(service, 'findOne').mockResolvedValue(dispute);
+      jest.spyOn(votesRepository, 'findOne').mockResolvedValue(null);
+      jest
+        .spyOn(votesRepository, 'find')
+        .mockResolvedValue([
+          makeVote(DisputeResolution.OVERTURNED, 70),
+          makeVote(DisputeResolution.UPHELD, 40),
+        ]);
+      const disputeSaveSpy = jest
+        .spyOn(disputesRepository, 'save')
+        .mockImplementation((d) => Promise.resolve(d as Dispute));
+
+      await service.castVote(
+        'dispute-vote-1',
+        { outcome: DisputeResolution.OVERTURNED },
+        voter,
+      );
+
+      // Total weight 110 >= 100 quorum, overturned (70) beats upheld (40).
+      expect(disputeSaveSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: DisputeStatus.RESOLVED,
+          resolution: DisputeResolution.OVERTURNED,
+          resolvedAt: expect.any(Date),
+        }),
+      );
+    });
+
+    it('lets reputation weighting flip the outcome vs 1-address-1-vote', async () => {
+      const dispute = makePendingTierDispute({ quorumThreshold: 100 });
+      jest.spyOn(service, 'findOne').mockResolvedValue(dispute);
+      jest.spyOn(votesRepository, 'findOne').mockResolvedValue(null);
+      // Three low-rep addresses uphold (naive count: UPHELD 3 vs OVERTURNED 1)
+      // but one high-rep address overturns (weighted: 100 vs 3).
+      jest
+        .spyOn(votesRepository, 'find')
+        .mockResolvedValue([
+          makeVote(DisputeResolution.UPHELD, 1),
+          makeVote(DisputeResolution.UPHELD, 1),
+          makeVote(DisputeResolution.UPHELD, 1),
+          makeVote(DisputeResolution.OVERTURNED, 100),
+        ]);
+      const disputeSaveSpy = jest
+        .spyOn(disputesRepository, 'save')
+        .mockImplementation((d) => Promise.resolve(d as Dispute));
+
+      await service.castVote(
+        'dispute-vote-1',
+        { outcome: DisputeResolution.OVERTURNED },
+        makeVoter({ reputation_score: 100, stellar_address: 'GWHALE' }),
+      );
+
+      expect(disputeSaveSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: DisputeStatus.RESOLVED,
+          resolution: DisputeResolution.OVERTURNED,
+        }),
+      );
+    });
+
+    it('throws BadRequestException when voting on a non-pending dispute', async () => {
+      jest
+        .spyOn(service, 'findOne')
+        .mockResolvedValue(
+          makePendingTierDispute({ status: DisputeStatus.RESOLVED }),
+        );
+
+      await expect(
+        service.castVote(
+          'dispute-vote-1',
+          { outcome: DisputeResolution.UPHELD },
+          makeVoter(),
+        ),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when the voter has no wallet address', async () => {
+      jest
+        .spyOn(service, 'findOne')
+        .mockResolvedValue(makePendingTierDispute());
+
+      await expect(
+        service.castVote(
+          'dispute-vote-1',
+          { outcome: DisputeResolution.UPHELD },
+          makeVoter({ stellar_address: undefined as unknown as string }),
+        ),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects a second vote from the same address across tiers', async () => {
+      // Tier-2 dispute escalated from a tier-1 dispute; the address already
+      // voted at tier 1, so the chain-wide lookup returns an existing vote.
+      const tier2 = makePendingTierDispute({
+        id: 'dispute-tier2',
+        tier: 2,
+        escalatedFromId: 'dispute-tier1',
+      });
+      jest.spyOn(service, 'findOne').mockResolvedValue(tier2);
+      jest.spyOn(disputesRepository, 'findOne').mockResolvedValue({
+        id: 'dispute-tier1',
+        escalatedFromId: null,
+      } as Dispute);
+      jest
+        .spyOn(votesRepository, 'findOne')
+        .mockResolvedValue({ id: 'existing-vote' } as DisputeVote);
+
+      await expect(
+        service.castVote(
+          'dispute-tier2',
+          { outcome: DisputeResolution.UPHELD },
+          makeVoter(),
+        ),
+      ).rejects.toThrow(ConflictException);
+
+      // The double-vote lookup spans the whole chain (tier 2 + tier 1).
+      expect(votesRepository.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ voterAddress: 'GVOTER1' }),
+        }),
+      );
+    });
+
+    it('treats a negative reputation score as zero weight', async () => {
+      const dispute = makePendingTierDispute();
+      jest.spyOn(service, 'findOne').mockResolvedValue(dispute);
+      jest.spyOn(votesRepository, 'findOne').mockResolvedValue(null);
+      jest.spyOn(votesRepository, 'find').mockResolvedValue([]);
+
+      await service.castVote(
+        'dispute-vote-1',
+        { outcome: DisputeResolution.UPHELD },
+        makeVoter({ reputation_score: -10 }),
+      );
+
+      expect(votesRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ weight: 0 }),
+      );
+    });
+  });
+
+  describe('escalate', () => {
+    const makeResolvedTierDispute = (
+      overrides: Partial<Dispute> = {},
+    ): Dispute =>
+      ({
+        id: 'dispute-esc-1',
+        marketId: 'market-123',
+        disputantId: 'user-123',
+        reason: 'Escalation reason',
+        status: DisputeStatus.RESOLVED,
+        resolution: DisputeResolution.UPHELD,
+        resolvedAt: new Date(),
+        tier: 1,
+        quorumThreshold: 100,
+        escalatedFromId: null,
+        ...overrides,
+      }) as Dispute;
+
+    const mockEscalator = { id: 'escalator-1' } as User;
+
+    it('creates a higher-tier dispute within the escalation window', async () => {
+      const tier1 = makeResolvedTierDispute();
+      const escalated = makeResolvedTierDispute({
+        id: 'dispute-esc-2',
+        tier: 2,
+        status: DisputeStatus.PENDING,
+      });
+      jest
+        .spyOn(service, 'findOne')
+        .mockResolvedValueOnce(tier1)
+        .mockResolvedValueOnce(escalated);
+      // No existing escalation of this tier.
+      jest.spyOn(disputesRepository, 'findOne').mockResolvedValue(null);
+      jest
+        .spyOn(disputesRepository, 'create')
+        .mockImplementation((d) => d as Dispute);
+      jest.spyOn(disputesRepository, 'save').mockResolvedValue(escalated);
+
+      const result = await service.escalate('dispute-esc-1', mockEscalator);
+
+      expect(disputesRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          marketId: 'market-123',
+          disputantId: 'user-123',
+          reason: 'Escalation reason',
+          status: DisputeStatus.PENDING,
+          tier: 2,
+          quorumThreshold: 200, // tier-1 quorum (100) x multiplier (2)
+          escalatedFromId: 'dispute-esc-1',
+        }),
+      );
+      expect(result).toEqual(escalated);
+    });
+
+    it('throws BadRequestException when the dispute is not resolved', async () => {
+      jest
+        .spyOn(service, 'findOne')
+        .mockResolvedValue(
+          makeResolvedTierDispute({ status: DisputeStatus.PENDING }),
+        );
+
+      await expect(
+        service.escalate('dispute-esc-1', mockEscalator),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when escalating past MAX_TIER', async () => {
+      jest
+        .spyOn(service, 'findOne')
+        .mockResolvedValue(makeResolvedTierDispute({ tier: MAX_TIER }));
+
+      await expect(
+        service.escalate('dispute-esc-1', mockEscalator),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when the escalation window has passed', async () => {
+      jest.spyOn(service, 'findOne').mockResolvedValue(
+        makeResolvedTierDispute({
+          resolvedAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), // 30 days ago
+        }),
+      );
+
+      await expect(
+        service.escalate('dispute-esc-1', mockEscalator),
+      ).rejects.toThrow(
+        new BadRequestException('Escalation window has passed'),
+      );
+    });
+
+    it('throws ConflictException when the tier was already escalated', async () => {
+      jest
+        .spyOn(service, 'findOne')
+        .mockResolvedValue(makeResolvedTierDispute());
+      jest
+        .spyOn(disputesRepository, 'findOne')
+        .mockResolvedValue({ id: 'dispute-esc-2' } as Dispute);
+
+      await expect(
+        service.escalate('dispute-esc-1', mockEscalator),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('rejects invalid tier jumps (e.g. tier 1 to tier 3)', async () => {
+      const tier1 = makeResolvedTierDispute({ tier: 1 });
+      jest.spyOn(service, 'findOne').mockResolvedValue(tier1);
+
+      await expect(
+        service.escalate('dispute-esc-1', mockEscalator, { target_tier: 3 }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('records who escalated and when on escalation', async () => {
+      const tier1 = makeResolvedTierDispute();
+      const escalated = makeResolvedTierDispute({
+        id: 'dispute-esc-2',
+        tier: 2,
+        status: DisputeStatus.PENDING,
+        escalatedById: 'escalator-1',
+      });
+      jest
+        .spyOn(service, 'findOne')
+        .mockResolvedValueOnce(tier1)
+        .mockResolvedValueOnce(escalated);
+      jest.spyOn(disputesRepository, 'findOne').mockResolvedValue(null);
+      jest
+        .spyOn(disputesRepository, 'create')
+        .mockImplementation((d) => d as Dispute);
+      jest.spyOn(disputesRepository, 'save').mockResolvedValue(escalated);
+
+      await service.escalate('dispute-esc-1', mockEscalator);
+
+      expect(disputesRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          escalatedById: 'escalator-1',
+          escalatedAt: expect.any(Date),
+        }),
+      );
+    });
+  });
+
+  describe('state machine transitions', () => {
+    it('valid status transitions succeed (open -> review -> escalated -> resolved)', () => {
+      expect(() =>
+        service.validateStatusTransition(DisputeStatus.OPEN, DisputeStatus.REVIEW),
+      ).not.toThrow();
+
+      expect(() =>
+        service.validateStatusTransition(DisputeStatus.REVIEW, DisputeStatus.ESCALATED),
+      ).not.toThrow();
+
+      expect(() =>
+        service.validateStatusTransition(
+          DisputeStatus.ESCALATED,
+          DisputeStatus.RESOLVED,
+        ),
+      ).not.toThrow();
+    });
+
+    it('invalid status transitions throw BadRequestException', () => {
+      expect(() =>
+        service.validateStatusTransition(
+          DisputeStatus.OPEN,
+          DisputeStatus.ESCALATED,
+        ),
+      ).toThrow(BadRequestException);
+
+      expect(() =>
+        service.validateStatusTransition(
+          DisputeStatus.OPEN,
+          DisputeStatus.RESOLVED,
+        ),
+      ).toThrow(BadRequestException);
+
+      expect(() =>
+        service.validateStatusTransition(
+          DisputeStatus.RESOLVED,
+          DisputeStatus.OPEN,
+        ),
+      ).toThrow(BadRequestException);
+    });
+
+    it('valid tier transitions succeed (1 -> 2 -> 3)', () => {
+      expect(() => service.validateTierTransition(1, 2)).not.toThrow();
+      expect(() => service.validateTierTransition(2, 3)).not.toThrow();
+    });
+
+    it('invalid tier transitions throw BadRequestException', () => {
+      expect(() => service.validateTierTransition(1, 3)).toThrow(
+        BadRequestException,
+      );
+      expect(() => service.validateTierTransition(3, 4)).toThrow(
+        BadRequestException,
+      );
+      expect(() => service.validateTierTransition(2, 1)).toThrow(
+        BadRequestException,
+      );
+    });
+  });
+
+  describe('findBreachedDisputes', () => {
+    it('returns pending disputes where slaBreachedAt is set', async () => {
+      const breachedDispute = {
+        id: 'dispute-breached-1',
+        slaBreachedAt: new Date(),
+        status: DisputeStatus.PENDING,
+      } as Dispute;
+
+      jest
+        .spyOn(disputesRepository, 'find')
+        .mockResolvedValue([breachedDispute]);
+
+      const result = await service.findBreachedDisputes();
+      expect(result).toEqual([breachedDispute]);
+      expect(disputesRepository.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: DisputeStatus.PENDING,
+          }),
+        }),
+      );
     });
   });
 });

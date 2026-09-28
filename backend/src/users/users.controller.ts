@@ -9,6 +9,9 @@ import {
   Query,
   UsePipes,
   ValidationPipe,
+  HttpCode,
+  HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { plainToInstance } from 'class-transformer';
@@ -38,6 +41,8 @@ import {
   ListUserBookmarksDto,
   PaginatedUserBookmarksResponse,
 } from './dto/list-user-bookmarks.dto';
+import { CreateBookmarkDto } from './dto/create-bookmark.dto';
+import { UserBookmark } from '../markets/entities/user-bookmark.entity';
 import { ApiBearerAuth } from '@nestjs/swagger';
 
 import { ListUserCompetitionsDto } from './dto/list-user-competitions.dto';
@@ -51,6 +56,8 @@ import {
   ClaimReferralResponseDto,
   MyReferralsResponseDto,
 } from './dto/referral.dto';
+import { GetFeedQueryDto } from './dto/get-feed-query.dto';
+import { FeedResponseDto } from './dto/feed-response.dto';
 
 @Controller('users')
 export class UsersController {
@@ -96,6 +103,35 @@ export class UsersController {
     @Query() query: ListUserBookmarksDto,
   ): Promise<PaginatedUserBookmarksResponse> {
     return this.usersService.findUserBookmarks(user.id, query);
+  }
+
+  @Post('me/bookmarks')
+  @ApiBearerAuth()
+  @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Bookmark a market for the current user' })
+  @ApiResponse({ status: 201, description: 'Market bookmarked' })
+  @ApiResponse({ status: 404, description: 'Market not found' })
+  @ApiResponse({ status: 409, description: 'Market already bookmarked' })
+  async createBookmark(
+    @CurrentUser() user: User,
+    @Body() dto: CreateBookmarkDto,
+  ): Promise<UserBookmark> {
+    return this.usersService.addBookmark(user.id, dto.market_id);
+  }
+
+  @Delete('me/bookmarks/:id')
+  @ApiBearerAuth()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Remove a bookmark owned by the current user' })
+  @ApiResponse({ status: 200, description: 'Bookmark removed' })
+  @ApiResponse({ status: 404, description: 'Bookmark not found' })
+  async deleteBookmark(
+    @CurrentUser() user: User,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ success: true }> {
+    await this.usersService.removeBookmark(user.id, id);
+    return { success: true };
   }
 
   @Get('me/referrals')
@@ -145,9 +181,37 @@ export class UsersController {
     return this.usersService.claimReferral(user.id, dto.referrer_id);
   }
 
-  @Patch('me')
+  @Get('me/feed')
+  @ApiBearerAuth()
   @UsePipes(
     new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false }),
+  )
+  @ApiOperation({
+    summary: 'Get personalized activity feed from followed users',
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Paginated feed of predictions from followed users, ordered by recency. ' +
+      'Excludes activity from soft-deleted users. ' +
+      'No block exclusion applied — no blocked-users model exists in this codebase yet.',
+    type: FeedResponseDto,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getMyFeed(
+    @CurrentUser() user: User,
+    @Query() query: GetFeedQueryDto,
+  ): Promise<FeedResponseDto> {
+    return this.usersService.getFeed(user.id, query);
+  }
+
+  @Patch('me')
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    }),
   )
   @ApiOperation({ summary: 'Update own profile (username, avatar_url)' })
   @ApiResponse({

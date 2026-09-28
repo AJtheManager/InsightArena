@@ -5,10 +5,14 @@ use crate::errors::InsightArenaError;
 use crate::escrow;
 use crate::market;
 use crate::reputation;
-use crate::storage_types::{ArbiterAssignment, ArbiterTally, DataKey, Dispute, UserProfile};
+use crate::storage_types::{ArbiterAssignment, ArbiterTally, DataKey, Dispute, OracleSubmission, UserProfile};
 
 fn bump_dispute(env: &Env, market_id: u64) {
-    config::extend_market_ttl(env, market_id);
+    // A disputed market is still active (its escrow pool and price
+    // accumulator, if any, remain live for stakers), so every dispute write
+    // must bump the full hot-key set, not just the market record. See
+    // Issue #1516.
+    config::extend_active_market_ttl(env, market_id);
     env.storage().persistent().extend_ttl(
         &DataKey::Dispute(market_id),
         config::PERSISTENT_THRESHOLD,
@@ -147,15 +151,28 @@ pub fn resolve_dispute(
     config::ensure_not_paused(&env)?;
     require_admin(&env, &admin)?;
 
-    let dispute: Dispute = env
+    let mut dispute: Dispute = env
         .storage()
         .persistent()
         .get(&DataKey::Dispute(market_id))
         .ok_or(InsightArenaError::DisputeNotFound)?;
 
+    // Guard against double-resolution (reuses ZeroShareTransfer)
+    if dispute.is_resolved {
+        return Err(InsightArenaError::ZeroShareTransfer);
+    }
+
+    // Mark as resolved before any state changes
+    dispute.is_resolved = true;
+    dispute.resolution_upheld = Some(uphold);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Dispute(market_id), &dispute);
+    bump_dispute(&env, market_id);
+
     if uphold {
-        // Return bond to disputer and reopen market for re-resolution.
-        escrow::refund(&env, &dispute.disputer, dispute.bond)?;
+        // Disputer wins: refund their bond in full, reopen market
+        escrow::distribute_slashed_bond(&env, Some(&dispute.disputer), dispute.bond, dispute.bond)?;
 
         let mut market = market::get_market(&env, market_id)?;
         market.is_resolved = false;
@@ -164,13 +181,22 @@ pub fn resolve_dispute(
         env.storage()
             .persistent()
             .set(&DataKey::Market(market_id), &market);
-        config::extend_market_ttl(&env, market_id);
+        config::extend_active_market_ttl(&env, market_id);
+
+        // Reputation impact: market creator gets additional penalty
+        reputation::on_dispute_upheld(&env, &market.creator);
     } else {
-        // Slash bond: route the configured insurance-pool share to the
-        // reserve, with the remainder to treasury (accounting balances only,
-        // funds remain in escrow).
-        escrow::slash_funds(&env, dispute.bond)?;
+        // Disputer loses: slash their bond (winner refund = 0, so full amount slashed)
+        escrow::distribute_slashed_bond(&env, None, 0, dispute.bond)?;
+
+        // Reputation impact: disputer gets penalty for frivolous dispute
+        reputation::on_dispute_rejected(&env, &dispute.disputer);
     }
+
+    // Settle any staked oracle submission for this market now that the
+    // dispute has a final outcome: slashed if `uphold` (the oracle's
+    // resolution was wrong), refunded plus reward otherwise.
+    settle_oracle_submission(&env, market_id, uphold)?;
 
     // Remove market_id from active dispute list
     let active_list: Vec<u64> = env
@@ -310,8 +336,17 @@ pub fn resolve_appeal(
         .clone()
         .ok_or(InsightArenaError::DisputeNotFound)?;
 
+    let appeal_bond = dispute.appeal_bond;
+
+    // Guard against double-resolution of the same appeal (reuses EscrowEmpty)
+    if appeal_bond == 0 {
+        return Err(InsightArenaError::EscrowEmpty);
+    }
+
     if uphold {
-        escrow::refund(&env, &appealer, dispute.appeal_bond)?;
+        // Appealer wins: refund their bond in full, reopen market
+        escrow::distribute_slashed_bond(&env, Some(&appealer), appeal_bond, appeal_bond)?;
+
         let mut market = market::get_market(&env, market_id)?;
         market.is_resolved = false;
         market.resolved_outcome = None;
@@ -319,9 +354,16 @@ pub fn resolve_appeal(
         env.storage()
             .persistent()
             .set(&DataKey::Market(market_id), &market);
-        config::extend_market_ttl(&env, market_id);
+        config::extend_active_market_ttl(&env, market_id);
+
+        // Reputation impact: market creator gets additional penalty for wrong resolution
+        reputation::on_dispute_upheld(&env, &market.creator);
     } else {
-        escrow::slash_funds(&env, dispute.appeal_bond)?;
+        // Appealer loses: slash their bond
+        escrow::distribute_slashed_bond(&env, None, 0, appeal_bond)?;
+
+        // Reputation impact: appealer gets penalty for frivolous appeal
+        reputation::on_dispute_rejected(&env, &appealer);
     }
 
     dispute.appealer = None;
@@ -738,7 +780,8 @@ fn emit_arbiter_vote_finalized(
 /// `resolve_dispute` — uphold refunds the disputer's bond and reopens the
 /// market, reject slashes the disputer's bond. Ties (`uphold_weight ==
 /// reject_weight`) resolve to reject, preserving the original market
-/// resolution as the safe default.
+/// resolution as the safe default. Reputation deltas are applied to both
+/// the disputer and the market creator based on the outcome.
 pub fn finalize_arbiter_vote(
     env: Env,
     caller: Address,
@@ -747,7 +790,7 @@ pub fn finalize_arbiter_vote(
     config::ensure_not_paused(&env)?;
     require_admin(&env, &caller)?;
 
-    let dispute: Dispute = env
+    let mut dispute: Dispute = env
         .storage()
         .persistent()
         .get(&DataKey::Dispute(market_id))
@@ -756,6 +799,11 @@ pub fn finalize_arbiter_vote(
     if dispute.arbiters.is_empty() {
         // No panel was ever assigned to this dispute.
         return Err(InsightArenaError::InvalidInput);
+    }
+
+    // Guard against double-resolution (reuses ZeroShareTransfer)
+    if dispute.is_resolved {
+        return Err(InsightArenaError::ZeroShareTransfer);
     }
 
     let now = env.ledger().timestamp();
@@ -769,8 +817,17 @@ pub fn finalize_arbiter_vote(
 
     let uphold = tally.uphold_weight > tally.reject_weight;
 
+    // Mark as resolved before any state changes
+    dispute.is_resolved = true;
+    dispute.resolution_upheld = Some(uphold);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Dispute(market_id), &dispute);
+    bump_dispute(&env, market_id);
+
     if uphold {
-        escrow::refund(&env, &dispute.disputer, dispute.bond)?;
+        // Disputer wins: refund their bond in full, reopen market
+        escrow::distribute_slashed_bond(&env, Some(&dispute.disputer), dispute.bond, dispute.bond)?;
 
         let mut market = market::get_market(&env, market_id)?;
         market.is_resolved = false;
@@ -779,10 +836,21 @@ pub fn finalize_arbiter_vote(
         env.storage()
             .persistent()
             .set(&DataKey::Market(market_id), &market);
-        config::extend_market_ttl(&env, market_id);
+        config::extend_active_market_ttl(&env, market_id);
+
+        // Reputation impact: market creator gets additional penalty
+        reputation::on_dispute_upheld(&env, &market.creator);
     } else {
-        escrow::slash_funds(&env, dispute.bond)?;
+        // Disputer loses: slash their bond
+        escrow::distribute_slashed_bond(&env, None, 0, dispute.bond)?;
+
+        // Reputation impact: disputer gets penalty for frivolous dispute
+        reputation::on_dispute_rejected(&env, &dispute.disputer);
     }
+
+    // Settle any staked oracle submission for this market, mirroring
+    // resolve_dispute's handling.
+    settle_oracle_submission(&env, market_id, uphold)?;
 
     // Remove market_id from the active dispute list, mirroring
     // resolve_dispute's cleanup.
@@ -821,4 +889,219 @@ pub fn finalize_arbiter_vote(
     );
 
     Ok(())
+}
+
+// ── Oracle Submission Staking ─────────────────────────────────────────────────
+//
+// An oracle bonds a stake when it submits a market resolution. The stake is
+// held through the market's post-resolution dispute window and settled
+// exactly once:
+// - if a dispute is raised and ultimately upholds (the resolution was wrong),
+//   the stake is slashed via `settle_oracle_submission`, called from the two
+//   terminal dispute-settlement paths (`resolve_dispute`, `finalize_arbiter_vote`);
+// - otherwise (no dispute is ever raised, or one is raised and rejected) the
+//   stake is returned to the oracle plus a reward, either via those same
+//   settlement paths or, if no dispute was ever filed, via `claim_oracle_stake`
+//   once the dispute window has elapsed.
+//
+// Keyed by a raw `(Symbol, u64)` tuple rather than a `DataKey` variant, since
+// `DataKey` is already at its 50-variant XDR cap (see
+// `reputation::trusted_creator_key` for the established precedent).
+
+fn oracle_submission_key(market_id: u64) -> (Symbol, u64) {
+    (symbol_short!("oracsub"), market_id)
+}
+
+fn get_oracle_submission(env: &Env, market_id: u64) -> Option<OracleSubmission> {
+    env.storage().persistent().get(&oracle_submission_key(market_id))
+}
+
+fn store_oracle_submission(env: &Env, submission: &OracleSubmission) {
+    let key = oracle_submission_key(submission.market_id);
+    env.storage().persistent().set(&key, submission);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, config::PERSISTENT_THRESHOLD, config::PERSISTENT_BUMP);
+}
+
+fn emit_oracle_submission_staked(env: &Env, market_id: u64, oracle: &Address, stake_amount: i128) {
+    env.events().publish(
+        (symbol_short!("orac"), symbol_short!("staked")),
+        (market_id, oracle.clone(), stake_amount),
+    );
+}
+
+fn emit_oracle_stake_slashed(env: &Env, market_id: u64, oracle: &Address, stake_amount: i128) {
+    env.events().publish(
+        (symbol_short!("orac"), symbol_short!("slashed")),
+        (market_id, oracle.clone(), stake_amount),
+    );
+}
+
+fn emit_oracle_stake_returned(
+    env: &Env,
+    market_id: u64,
+    oracle: &Address,
+    stake_amount: i128,
+    reward: i128,
+) {
+    env.events().publish(
+        (symbol_short!("orac"), symbol_short!("returned")),
+        (market_id, oracle.clone(), stake_amount, reward),
+    );
+}
+
+/// Submit a market resolution backed by a locked oracle stake.
+///
+/// Wraps `market::resolve_market` with a mandatory bond: the configured
+/// `Config::oracle_stake_amount` is transferred from the oracle into escrow
+/// before the resolution is recorded. If the oracle cannot cover that
+/// transfer, the whole call reverts (the `Submission reverts without the
+/// required stake` acceptance criterion) — no separate balance check is
+/// needed since `escrow::lock_stake` fails the transaction directly.
+///
+/// # Errors
+/// - `Unauthorized` if `oracle` is not the configured oracle address.
+/// - `DisputeAlreadyFiled` — reused to mean a staked submission already
+///   exists for this market (error enum is at its 50-case cap).
+/// - `InvalidInput` if `Config::oracle_stake_amount` is non-positive.
+/// - Propagates any error from `escrow::lock_stake` or `market::resolve_market`.
+pub fn submit_resolution_with_stake(
+    env: Env,
+    oracle: Address,
+    market_id: u64,
+    resolved_outcome: Symbol,
+) -> Result<(), InsightArenaError> {
+    config::ensure_not_paused(&env)?;
+    oracle.require_auth();
+
+    let cfg = config::get_config(&env)?;
+    if oracle != cfg.oracle_address {
+        return Err(InsightArenaError::Unauthorized);
+    }
+
+    // Block only while a submission is still pending settlement. A settled
+    // record means either the prior submission was slashed and the dispute
+    // reopened this market (`resolve_dispute` / `finalize_arbiter_vote` with
+    // `uphold = true`) — in which case a fresh resolution with a fresh stake
+    // must be submittable — or it already paid out, in which case
+    // `market::resolve_market`'s own `MarketAlreadyResolved` guard below
+    // handles rejection.
+    if let Some(existing) = get_oracle_submission(&env, market_id) {
+        if !existing.settled {
+            return Err(InsightArenaError::DisputeAlreadyFiled);
+        }
+    }
+
+    if cfg.oracle_stake_amount <= 0 {
+        return Err(InsightArenaError::InvalidInput);
+    }
+
+    escrow::lock_stake(&env, &oracle, cfg.oracle_stake_amount)?;
+
+    market::resolve_market(env.clone(), oracle.clone(), market_id, resolved_outcome)?;
+
+    let now = env.ledger().timestamp();
+    store_oracle_submission(
+        &env,
+        &OracleSubmission {
+            market_id,
+            oracle: oracle.clone(),
+            stake_amount: cfg.oracle_stake_amount,
+            submitted_at: now,
+            settled: false,
+        },
+    );
+
+    emit_oracle_submission_staked(&env, market_id, &oracle, cfg.oracle_stake_amount);
+
+    Ok(())
+}
+
+/// Settle a market's staked oracle submission exactly once: slash it if
+/// `uphold` is true (the dispute overturned the resolution), otherwise
+/// refund the stake plus a reward capped at the live treasury balance. A
+/// no-op if this market never had a staked submission, or it was already
+/// settled — safe to call unconditionally from every terminal dispute path.
+fn settle_oracle_submission(env: &Env, market_id: u64, uphold: bool) -> Result<(), InsightArenaError> {
+    let Some(mut submission) = get_oracle_submission(env, market_id) else {
+        return Ok(());
+    };
+    if submission.settled {
+        return Ok(());
+    }
+
+    if uphold {
+        escrow::slash_funds(env, submission.stake_amount)?;
+        emit_oracle_stake_slashed(env, market_id, &submission.oracle, submission.stake_amount);
+    } else {
+        escrow::refund(env, &submission.oracle, submission.stake_amount)?;
+
+        let cfg = config::get_config(env)?;
+        let treasury_balance = escrow::get_treasury_balance(env);
+        let reward = submission
+            .stake_amount
+            .saturating_mul(cfg.oracle_reward_bps as i128)
+            / 10_000;
+        let reward = reward.min(treasury_balance).max(0);
+        if reward > 0 {
+            escrow::pay_oracle_reward(env, &submission.oracle, reward)?;
+        }
+
+        emit_oracle_stake_returned(env, market_id, &submission.oracle, submission.stake_amount, reward);
+    }
+
+    submission.settled = true;
+    store_oracle_submission(env, &submission);
+
+    Ok(())
+}
+
+/// Claim a staked oracle submission's stake plus reward when no dispute was
+/// ever filed and the market's dispute window has elapsed. Callable by
+/// anyone (the payout always goes to the recorded oracle address, not the
+/// caller), mirroring the permissionless style of `market::extend_market_ttl`.
+///
+/// For markets that *were* disputed, settlement happens automatically inside
+/// `resolve_dispute` / `finalize_arbiter_vote` instead — this entrypoint
+/// exists only for the undisputed path.
+///
+/// # Errors
+/// - `DisputeNotFound` — reused to mean no staked submission exists for this
+///   market (error enum is at its 50-case cap).
+/// - `RefundAlreadyClaimed` — reused to mean this submission was already
+///   settled.
+/// - `DisputeAlreadyFiled` — reused to mean an active dispute still exists
+///   for this market; it must resolve first via `resolve_dispute` /
+///   `finalize_arbiter_vote`, which settles the stake automatically.
+/// - `TimelockNotElapsed` if the dispute window has not yet closed.
+pub fn claim_oracle_stake(env: Env, market_id: u64) -> Result<(), InsightArenaError> {
+    config::ensure_not_paused(&env)?;
+
+    let submission = get_oracle_submission(&env, market_id).ok_or(InsightArenaError::DisputeNotFound)?;
+    if submission.settled {
+        return Err(InsightArenaError::RefundAlreadyClaimed);
+    }
+
+    if env.storage().persistent().has(&DataKey::Dispute(market_id)) {
+        return Err(InsightArenaError::DisputeAlreadyFiled);
+    }
+
+    let market = market::get_market(&env, market_id)?;
+    let resolved_at = market
+        .resolved_at
+        .ok_or(InsightArenaError::MarketNotResolved)?;
+    let deadline = resolved_at
+        .checked_add(market.dispute_window)
+        .ok_or(InsightArenaError::Overflow)?;
+    if env.ledger().timestamp() <= deadline {
+        return Err(InsightArenaError::TimelockNotElapsed);
+    }
+
+    settle_oracle_submission(&env, market_id, false)
+}
+
+/// Read-only lookup of a market's staked oracle submission, if any.
+pub fn get_oracle_submission_info(env: Env, market_id: u64) -> Option<OracleSubmission> {
+    get_oracle_submission(&env, market_id)
 }

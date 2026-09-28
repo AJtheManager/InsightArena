@@ -18,7 +18,8 @@ export enum Interval {
 export class PriceHistoryQueryDto {
   @ApiProperty({
     enum: TimeRange,
-    description: 'The time range for the price history (e.g., 1h, 1d, 7d, 30d, all)',
+    description:
+      'The time range for the price history (e.g., 1h, 1d, 7d, 30d, all)',
   })
   @IsEnum(TimeRange)
   timeRange: TimeRange;

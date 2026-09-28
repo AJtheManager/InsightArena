@@ -3,7 +3,11 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { MarketsService } from './markets.service';
 import { MarketPriceSnapshot } from './entities/market-price-snapshot.entity';
 import { Market } from './entities/market.entity';
-import { PriceHistoryQueryDto, TimeRange, Interval } from './dto/price-history-query.dto';
+import {
+  PriceHistoryQueryDto,
+  TimeRange,
+  Interval,
+} from './dto/price-history-query.dto';
 
 // Missing imports added based on user's guidance
 import { Comment } from './entities/comment.entity';
@@ -14,6 +18,7 @@ import { UsersService } from '../users/users.service';
 import { SorobanService } from '../soroban/soroban.service';
 import { DataSource } from 'typeorm';
 import { WebhookDispatcherService } from '../webhooks/services/webhook-dispatcher.service';
+import { SearchService } from '../search/search.service';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { MarketSettlementScheduler } from './market-settlement.scheduler';
 
@@ -65,15 +70,21 @@ describe('MarketsService - getPriceHistory', () => {
         { provide: SorobanService, useValue: {} },
         { provide: DataSource, useValue: {} },
         { provide: WebhookDispatcherService, useValue: { emit: jest.fn() } },
+        {
+          provide: SearchService,
+          useValue: { refreshMarketSearchVector: jest.fn() },
+        },
         { provide: CACHE_MANAGER, useValue: {} },
         { provide: MarketSettlementScheduler, useValue: {} },
       ],
     }).compile();
 
     service = module.get<MarketsService>(MarketsService);
-    
+
     // Stub findByIdOrOnChainId so it doesn't try to query the real repo
-    jest.spyOn(service as any, 'findByIdOrOnChainId').mockResolvedValue({ id: 'market-1' } as Market);
+    jest
+      .spyOn(service as any, 'findByIdOrOnChainId')
+      .mockResolvedValue({ id: 'market-1' } as Market);
   });
 
   afterEach(() => {
@@ -88,8 +99,13 @@ describe('MarketsService - getPriceHistory', () => {
 
     const result = await service.getPriceHistory('market-1', query);
 
-    expect(mockQueryBuilder.andWhere).not.toHaveBeenCalledWith(expect.stringContaining('INTERVAL'));
-    expect(mockQueryBuilder.select).toHaveBeenCalledWith("date_trunc('hour', snapshot.created_at)", 'timestamp');
+    expect(mockQueryBuilder.andWhere).not.toHaveBeenCalledWith(
+      expect.stringContaining('INTERVAL'),
+    );
+    expect(mockQueryBuilder.select).toHaveBeenCalledWith(
+      "date_trunc('hour', snapshot.created_at)",
+      'timestamp',
+    );
     expect(result).toEqual([]);
   });
 
@@ -107,8 +123,13 @@ describe('MarketsService - getPriceHistory', () => {
 
     const result = await service.getPriceHistory('market-1', query);
 
-    expect(mockQueryBuilder.andWhere).toHaveBeenCalledWith(`snapshot.created_at >= NOW() - INTERVAL '1 day'`);
-    expect(mockQueryBuilder.select).toHaveBeenCalledWith("date_trunc('minute', snapshot.created_at)", 'timestamp');
+    expect(mockQueryBuilder.andWhere).toHaveBeenCalledWith(
+      `snapshot.created_at >= NOW() - INTERVAL '1 day'`,
+    );
+    expect(mockQueryBuilder.select).toHaveBeenCalledWith(
+      "date_trunc('minute', snapshot.created_at)",
+      'timestamp',
+    );
 
     // Test data mapping
     expect(result).toEqual([

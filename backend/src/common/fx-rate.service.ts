@@ -54,7 +54,11 @@ export class FxRateService {
       this.logger.warn(
         `FX rate fetch failed, falling back to base currency: ${err instanceof Error ? err.message : err}`,
       );
-      return { base: BASE_CURRENCY, rates: {}, fetched_at: new Date().toISOString() };
+      return {
+        base: BASE_CURRENCY,
+        rates: {},
+        fetched_at: new Date().toISOString(),
+      };
     }
   }
 

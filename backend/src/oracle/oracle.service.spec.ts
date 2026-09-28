@@ -1,9 +1,18 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository, SelectQueryBuilder } from 'typeorm';
+import { ConfigService } from '@nestjs/config';
 import { OracleService } from './oracle.service';
+import { OracleReliabilityService } from './oracle-reliability.service';
 import { CreatorEventMatch } from '../creator-events/entities/creator-event-match.entity';
 import { CreatorEvent } from '../creator-events/entities/creator-event.entity';
+import { MatchResultDivergence } from '../matches/entities/match-result-divergence.entity';
+import {
+  OracleSubmission,
+  SubmissionReviewStatus,
+  SubmissionStatus,
+  WinningTeam,
+} from './entities/oracle-submission.entity';
 import { ListPendingMatchesQueryDto } from './dto/list-pending-matches-query.dto';
 
 type MockRepo = jest.Mocked<
@@ -18,6 +27,7 @@ function createMockQueryBuilder<T>(
     andWhere: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
     addOrderBy: jest.fn().mockReturnThis(),
+    leftJoinAndSelect: jest.fn().mockReturnThis(),
     skip: jest.fn().mockReturnThis(),
     take: jest.fn().mockReturnThis(),
     getManyAndCount: jest.fn().mockResolvedValue(returnValue),
@@ -34,6 +44,10 @@ describe('OracleService', () => {
   let service: OracleService;
   let matchRepo: MockRepo;
   let eventRepo: MockRepo;
+  let divergenceRepo: MockRepo;
+  let submissionRepo: MockRepo;
+  let reliabilityService: jest.Mocked<OracleReliabilityService>;
+  let configValues: Record<string, string | number | undefined>;
 
   const mockEvent = {
     id: 'event-1',
@@ -82,15 +96,52 @@ describe('OracleService', () => {
       findByIds: jest.fn(),
     };
 
+    divergenceRepo = {
+      findOne: jest.fn(),
+      createQueryBuilder: jest.fn(),
+      find: jest.fn(),
+      findByIds: jest.fn(),
+    };
+
+    submissionRepo = {
+      findOne: jest.fn(),
+      createQueryBuilder: jest.fn(),
+      find: jest.fn(),
+      findByIds: jest.fn(),
+    };
+
+    configValues = {};
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         OracleService,
         { provide: getRepositoryToken(CreatorEventMatch), useValue: matchRepo },
         { provide: getRepositoryToken(CreatorEvent), useValue: eventRepo },
+        {
+          provide: getRepositoryToken(MatchResultDivergence),
+          useValue: divergenceRepo,
+        },
+        {
+          provide: getRepositoryToken(OracleSubmission),
+          useValue: submissionRepo,
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => configValues[key]),
+          },
+        },
+        {
+          provide: OracleReliabilityService,
+          useValue: {
+            getWeight: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
     service = module.get<OracleService>(OracleService);
+    reliabilityService = module.get(OracleReliabilityService);
     eventRepo.find.mockResolvedValue([mockEvent]);
   });
 
@@ -403,6 +454,323 @@ describe('OracleService', () => {
         'm.result_submitted = :submitted',
         { submitted: true },
       );
+    });
+  });
+
+  describe('getDivergences', () => {
+    it('returns paginated unresolved divergences ordered by most recent', async () => {
+      const rows = [
+        {
+          id: 'div-1',
+          match: { id: 'match-1' },
+          source_a_name: 'match_submitted_result',
+          source_a_value: { home_score: 1 },
+          source_b_name: 'external_feed',
+          source_b_value: { home_score: 2 },
+          created_at: new Date('2026-01-01T00:00:00Z'),
+        },
+        {
+          id: 'div-2',
+          match: { id: 'match-2' },
+          source_a_name: 'queued_external_result',
+          source_a_value: { home_score: 3 },
+          source_b_name: 'external_feed',
+          source_b_value: { home_score: 4 },
+          created_at: new Date('2026-01-02T00:00:00Z'),
+        },
+      ];
+      const qb = createMockQueryBuilder<MatchResultDivergence>([rows, 2]);
+      divergenceRepo.createQueryBuilder.mockReturnValue(
+        qb as unknown as SelectQueryBuilder<MatchResultDivergence>,
+      );
+
+      const result = await service.getDivergences({ page: 1, limit: 20 });
+
+      expect(qb.where).toHaveBeenCalledWith('d.resolved = false');
+      expect(result.data).toHaveLength(2);
+      expect(result.total).toBe(2);
+      expect(result.page).toBe(1);
+      expect(result.limit).toBe(20);
+      expect(result.data[0]).toEqual(
+        expect.objectContaining({ id: 'div-1', match_id: 'match-1' }),
+      );
+    });
+
+    it('returns an empty page when there are no unresolved divergences', async () => {
+      const qb = createMockQueryBuilder<MatchResultDivergence>([[], 0]);
+      divergenceRepo.createQueryBuilder.mockReturnValue(
+        qb as unknown as SelectQueryBuilder<MatchResultDivergence>,
+      );
+
+      const result = await service.getDivergences({ page: 1, limit: 20 });
+
+      expect(result.data).toHaveLength(0);
+      expect(result.total).toBe(0);
+    });
+  });
+
+  // ── Consensus auto-finalization gating (#1611) ──────────────────────────────
+
+  describe('getMatchConsensus', () => {
+    let nextId: number;
+
+    const baseSubmission = (): OracleSubmission =>
+      ({
+        id: '',
+        match_id: '123',
+        team_a: 'Team A',
+        team_b: 'Team B',
+        data_source: 'https://api.example.com',
+        winning_team: WinningTeam.TEAM_A,
+        confidence_score: 92,
+        result_timestamp: new Date(),
+        status: SubmissionStatus.SUBMITTED,
+        retry_count: 0,
+        is_anomaly: false,
+        review_status: SubmissionReviewStatus.NOT_REQUIRED,
+        created_at: new Date(),
+      }) as OracleSubmission;
+
+    const makeSubmission = (
+      overrides: Partial<OracleSubmission> = {},
+    ): OracleSubmission => ({
+      ...baseSubmission(),
+      id: `sub-${++nextId}`,
+      ...overrides,
+    });
+
+    beforeEach(() => {
+      nextId = 0;
+    });
+
+    it('excludes quarantined submissions from the auto-finalization consensus', async () => {
+      const normalA = makeSubmission({ confidence_score: 95 });
+      const normalB = makeSubmission({
+        data_source: 'https://alt.example.com',
+        confidence_score: 93,
+      });
+      // An anomaly held for review votes TEAM_B with a deviant score — it must
+      // have zero influence on the finalizable outcome.
+      const heldOutlier = makeSubmission({
+        winning_team: WinningTeam.TEAM_B,
+        confidence_score: 12,
+        is_anomaly: true,
+        review_status: SubmissionReviewStatus.HELD,
+      });
+      submissionRepo.find.mockResolvedValue([normalA, normalB, heldOutlier]);
+
+      const result = await service.getMatchConsensus('123');
+
+      expect(result.quarantined_count).toBe(1);
+      expect(result.quarantined_submissions).toEqual([
+        expect.objectContaining({
+          id: heldOutlier.id,
+          review_status: SubmissionReviewStatus.HELD,
+        }),
+      ]);
+      expect(result.eligible_participants).toBe(2);
+      expect(result.outcome_votes[WinningTeam.TEAM_A]).toBe(2);
+      expect(result.outcome_votes[WinningTeam.TEAM_B]).toBe(0);
+      expect(result.outcome).toBe(WinningTeam.TEAM_A);
+      expect(result.confidence_median).toBeCloseTo(94, 6);
+      expect(result.can_auto_finalize).toBe(true);
+      expect(result.reason).toBe('majority_reached');
+    });
+
+    it('blocks auto-finalization when quarantine leaves too few eligible sources', async () => {
+      submissionRepo.find.mockResolvedValue([
+        makeSubmission({
+          is_anomaly: true,
+          review_status: SubmissionReviewStatus.HELD,
+        }),
+      ]);
+
+      const result = await service.getMatchConsensus('123');
+
+      expect(result.can_auto_finalize).toBe(false);
+      expect(result.eligible_participants).toBe(0);
+      expect(result.minimum_required).toBe(2);
+      expect(result.outcome).toBeNull();
+      expect(result.reason).toBe('insufficient_sources');
+    });
+
+    it('keeps admin-approved anomalies in consensus but excludes rejected ones', async () => {
+      const approved = makeSubmission({
+        id: 'sub-approved',
+        is_anomaly: true,
+        review_status: SubmissionReviewStatus.APPROVED,
+        confidence_score: 91,
+      });
+      const rejected = makeSubmission({
+        id: 'sub-rejected',
+        winning_team: WinningTeam.TEAM_B,
+        confidence_score: 5,
+        status: SubmissionStatus.FAILED,
+        is_anomaly: true,
+        review_status: SubmissionReviewStatus.REJECTED,
+      });
+      const fresh = makeSubmission({ confidence_score: 94 });
+      submissionRepo.find.mockResolvedValue([approved, rejected, fresh]);
+
+      const result = await service.getMatchConsensus('123');
+
+      expect(result.quarantined_count).toBe(1);
+      expect(result.eligible_submissions.map((s) => s.id)).toEqual([
+        approved.id,
+        fresh.id,
+      ]);
+      expect(result.eligible_participants).toBe(2);
+      expect(result.outcome).toBe(WinningTeam.TEAM_A);
+      expect(result.can_auto_finalize).toBe(true);
+    });
+
+    it('reports a tie vote and blocks auto-finalization without a majority', async () => {
+      submissionRepo.find.mockResolvedValue([
+        makeSubmission({ winning_team: WinningTeam.TEAM_A }),
+        makeSubmission({ winning_team: WinningTeam.TEAM_B }),
+      ]);
+
+      const result = await service.getMatchConsensus('123');
+
+      expect(result.outcome).toBeNull();
+      expect(result.can_auto_finalize).toBe(false);
+      expect(result.reason).toBe('vote_tie');
+    });
+
+    it('honors a higher configurable minimum source count', async () => {
+      configValues['ORACLE_CONSENSUS_MIN_SOURCES'] = '3';
+      submissionRepo.find.mockResolvedValue([
+        makeSubmission(),
+        makeSubmission(),
+      ]);
+
+      const result = await service.getMatchConsensus('123');
+
+      // Unanimous majority among two eligible sources, but the configured floor
+      // requires three before auto-finalization may proceed.
+      expect(result.outcome).toBe(WinningTeam.TEAM_A);
+      expect(result.can_auto_finalize).toBe(false);
+      expect(result.reason).toBe('insufficient_sources');
+    });
+
+    it('weights consensus by oracle reliability scores (#1765)', async () => {
+      // High-reliability oracle votes TEAM_A
+      const highReliable = makeSubmission({
+        id: 'sub-high-reliable',
+        data_source: 'oracle-high',
+        winning_team: WinningTeam.TEAM_A,
+        confidence_score: 95,
+      });
+
+      // Low-reliability oracle votes TEAM_B
+      const lowReliable = makeSubmission({
+        id: 'sub-low-reliable',
+        data_source: 'oracle-low',
+        winning_team: WinningTeam.TEAM_B,
+        confidence_score: 85,
+      });
+
+      // Fresh oracle (no history) votes TEAM_B
+      const newOracle = makeSubmission({
+        id: 'sub-new',
+        data_source: 'oracle-new',
+        winning_team: WinningTeam.TEAM_B,
+        confidence_score: 88,
+      });
+
+      submissionRepo.find.mockResolvedValue([
+        highReliable,
+        lowReliable,
+        newOracle,
+      ]);
+
+      // High-reliability oracle has weight 0.9
+      reliabilityService.getWeight.mockImplementation(
+        async (source: string) => {
+          if (source === 'oracle-high') return 0.9;
+          if (source === 'oracle-low') return 0.2;
+          if (source === 'oracle-new') return 1.0; // default neutral weight
+          return 1.0;
+        },
+      );
+
+      const result = await service.getMatchConsensus('match-123');
+
+      // Weighted votes:
+      // TEAM_A: 0.9 (high-reliable)
+      // TEAM_B: 0.2 (low-reliable) + 1.0 (new) = 1.2
+      // Total weight: 2.1
+      // TEAM_B wins with 1.2/2.1 > 0.5
+      expect(result.outcome).toBe(WinningTeam.TEAM_B);
+      expect(result.can_auto_finalize).toBe(true);
+      expect(result.eligible_participants).toBe(3);
+    });
+
+    it('prevents single high-reliability oracle from unilaterally deciding outcome', async () => {
+      // High-reliability oracle votes TEAM_A
+      const perfect = makeSubmission({
+        id: 'sub-perfect',
+        data_source: 'oracle-perfect',
+        winning_team: WinningTeam.TEAM_A,
+        confidence_score: 99,
+      });
+
+      // Low-reliability oracle votes TEAM_B
+      const unreliable = makeSubmission({
+        id: 'sub-unreliable',
+        data_source: 'oracle-unreliable',
+        winning_team: WinningTeam.TEAM_B,
+        confidence_score: 50,
+      });
+
+      submissionRepo.find.mockResolvedValue([perfect, unreliable]);
+
+      reliabilityService.getWeight.mockImplementation(
+        async (source: string) => {
+          if (source === 'oracle-perfect') return 1.0; // perfect history
+          if (source === 'oracle-unreliable') return 0.5; // mediocre
+          return 1.0;
+        },
+      );
+
+      const result = await service.getMatchConsensus('match-456');
+
+      // Weighted votes:
+      // TEAM_A: 1.0 (perfect)
+      // TEAM_B: 0.5 (unreliable)
+      // Total: 1.5
+      // TEAM_A wins with 1.0/1.5 = 0.667 > 0.5 ✓
+      expect(result.outcome).toBe(WinningTeam.TEAM_A);
+      expect(result.can_auto_finalize).toBe(true);
+    });
+
+    it('detects tie in weighted consensus when weights split exactly 50/50', async () => {
+      const oracleA = makeSubmission({
+        id: 'sub-a',
+        data_source: 'oracle-a',
+        winning_team: WinningTeam.TEAM_A,
+        confidence_score: 90,
+      });
+
+      const oracleB = makeSubmission({
+        id: 'sub-b',
+        data_source: 'oracle-b',
+        winning_team: WinningTeam.TEAM_B,
+        confidence_score: 90,
+      });
+
+      submissionRepo.find.mockResolvedValue([oracleA, oracleB]);
+
+      reliabilityService.getWeight.mockResolvedValue(1.0); // equal weights
+
+      const result = await service.getMatchConsensus('match-tie');
+
+      // Weighted votes both equal 1.0 each
+      // Total = 2.0
+      // No winner > 0.5 of total
+      expect(result.outcome).toBeNull();
+      expect(result.can_auto_finalize).toBe(false);
+      expect(result.reason).toBe('vote_tie');
     });
   });
 });

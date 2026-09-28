@@ -378,11 +378,14 @@ fn test_claim_payout_already_claimed() {
     client.resolve_market(&oracle, &market_id, &symbol_short!("yes"));
 
     client.claim_payout(&predictor, &market_id);
+    let token = TokenClient::new(&env, &xlm_token);
+    let balance_after_first_claim = token.balance(&predictor);
     let result = client.try_claim_payout(&predictor, &market_id);
     assert!(matches!(
         result,
         Err(Ok(InsightArenaError::PayoutAlreadyClaimed))
     ));
+    assert_eq!(token.balance(&predictor), balance_after_first_claim);
 }
 
 #[test]
@@ -859,7 +862,135 @@ fn test_batch_all_losers_pays_nothing() {
     assert_eq!(token.balance(&client.address), 2 * stake);
 }
 
+/// Requirement: when all winners in a mixed market (winners + losers) have already
+/// claimed their payouts individually, batch_distribute_payouts processes 0 payouts,
+/// skips losers, and does not double-pay or error out.
+#[test]
+fn test_batch_mixed_all_winners_already_claimed_individually() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, oracle) = deploy(&env);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let (market_id, _creator, winners, losers) =
+        setup_mixed_market(&env, &client, &xlm_token, &oracle);
+
+    // All winners claim individually prior to batch distribution
+    for winner in winners.iter() {
+        let payout = client.claim_payout(winner, &market_id);
+        assert_eq!(payout, MIXED_NET_PAYOUT);
+        assert_eq!(token.balance(winner), MIXED_NET_PAYOUT);
+    }
+
+    // Batch distribution executed after all winners claimed individually
+    let processed = client.batch_distribute_payouts(&oracle, &market_id);
+    assert_eq!(processed, 0);
+
+    // Verify balances remain unchanged: winners keep single payout, losers receive 0
+    for winner in winners.iter() {
+        assert_eq!(token.balance(winner), MIXED_NET_PAYOUT);
+    }
+    for loser in losers.iter() {
+        assert_eq!(token.balance(loser), 0);
+    }
+}
+
+/// Requirement: in a mixed market (winners + losers) where a subset of winners
+/// claimed individually, batch_distribute_payouts processes only the remaining
+/// unclaimed winners, skips already-claimed winners and losers, and pays correct amounts.
+#[test]
+fn test_batch_mixed_partial_individual_claims() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, oracle) = deploy(&env);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let (market_id, _creator, winners, losers) =
+        setup_mixed_market(&env, &client, &xlm_token, &oracle);
+
+    // Winner 0 and Winner 2 claim individually; Winner 1 remains unclaimed
+    let p0 = client.claim_payout(&winners[0], &market_id);
+    let p2 = client.claim_payout(&winners[2], &market_id);
+    assert_eq!(p0, MIXED_NET_PAYOUT);
+    assert_eq!(p2, MIXED_NET_PAYOUT);
+
+    // Batch distribution should only process Winner 1 (1 winner processed)
+    let processed = client.batch_distribute_payouts(&oracle, &market_id);
+    assert_eq!(processed, 1);
+
+    // Verify all winners received exact payouts and losers received 0
+    for winner in winners.iter() {
+        assert_eq!(token.balance(winner), MIXED_NET_PAYOUT);
+    }
+    for loser in losers.iter() {
+        assert_eq!(token.balance(loser), 0);
+    }
+
+    // Second batch call processes 0
+    let processed_again = client.batch_distribute_payouts(&oracle, &market_id);
+    assert_eq!(processed_again, 0);
+}
+
+/// Requirement: in a large mixed market exceeding max batch limit (25), when an
+/// individual claim occurs between batch calls, the subsequent batch call
+/// correctly skips the newly claimed winner, processes remaining unclaimed winners,
+/// and skips all losers.
+#[test]
+fn test_batch_mixed_interleaved_individual_claim_between_batches() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, oracle) = deploy(&env);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let stake = 50_000_000_i128;
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    // 26 winners and 3 losers (total 29 predictors, exceeding batch limit of 25)
+    let mut winners = Vec::new(&env);
+    for _ in 0..26 {
+        let winner = Address::generate(&env);
+        fund(&env, &xlm_token, &winner, stake);
+        client.submit_prediction(&winner, &market_id, &symbol_short!("yes"), &stake);
+        winners.push_back(winner);
+    }
+
+    let mut losers = Vec::new(&env);
+    for _ in 0..3 {
+        let loser = Address::generate(&env);
+        fund(&env, &xlm_token, &loser, stake);
+        client.submit_prediction(&loser, &market_id, &symbol_short!("no"), &stake);
+        losers.push_back(loser);
+    }
+
+    env.ledger()
+        .with_mut(|li| li.timestamp = params.resolution_time + 1);
+    client.resolve_market(&oracle, &market_id, &symbol_short!("yes"));
+
+    // First batch runs: processes 25 winners (max limit)
+    let processed_first = client.batch_distribute_payouts(&oracle, &market_id);
+    assert_eq!(processed_first, 25);
+
+    // Before second batch, the 26th winner claims individually
+    let winner_26 = winners.get(25).unwrap();
+    let individual_payout = client.claim_payout(&winner_26, &market_id);
+    assert!(individual_payout > 0);
+
+    // Second batch runs: 0 remaining unclaimed winners
+    let processed_second = client.batch_distribute_payouts(&oracle, &market_id);
+    assert_eq!(processed_second, 0);
+
+    // All 26 winners received payouts, losers received 0
+    for winner in winners.iter() {
+        assert!(token.balance(&winner) > 0);
+    }
+    for loser in losers.iter() {
+        assert_eq!(token.balance(&loser), 0);
+    }
+}
+
 // ── payout_math tests ─────────────────────────────────────────────────────
+
 
 #[test]
 fn test_payout_math_two_winners() {
@@ -1097,4 +1228,502 @@ fn test_batch_distribute_payouts_idempotent_with_winners_and_losers() {
     // Losers received nothing (their stakes funded the winner payouts)
     assert_eq!(token.balance(&loser1), 0);
     assert_eq!(token.balance(&loser2), 0);
+}
+// ── stake bound enforcement on every prediction entry point (#1685) ───────
+
+/// Recompute the commit-reveal hash for (outcome, amount) with an empty salt,
+/// mirroring the preimage construction in `reveal_prediction`.
+fn commitment_hash(env: &Env, outcome: &Symbol, amount: i128) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    use soroban_sdk::IntoVal;
+    let mut preimage: soroban_sdk::Vec<soroban_sdk::Val> = soroban_sdk::vec![env];
+    preimage.push_back(outcome.clone().into_val(env));
+    preimage.push_back(amount.into_val(env));
+    env.crypto().sha256(&preimage.to_xdr(env)).to_bytes()
+}
+
+#[test]
+fn test_submit_predictions_batch_rejects_below_min_stake() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, xlm_token, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+    let stake = 20_000_000_i128;
+
+    let market_id_1 = client.create_market(&Address::generate(&env), &default_params(&env));
+    let market_id_2 = client.create_market(&Address::generate(&env), &default_params(&env));
+    fund(&env, &xlm_token, &predictor, stake * 3);
+
+    let requests = vec![
+        &env,
+        BatchPredictionRequest {
+            market_id: market_id_1,
+            chosen_outcome: symbol_short!("yes"),
+            stake_amount: stake, // valid
+        },
+        BatchPredictionRequest {
+            market_id: market_id_2,
+            chosen_outcome: symbol_short!("yes"),
+            stake_amount: 9_999_999_i128, // below min_stake
+        },
+    ];
+
+    let result = client.try_submit_predictions_batch(&predictor, &requests);
+    assert!(matches!(result, Err(Ok(InsightArenaError::StakeTooLow))));
+
+    // Atomic rollback: neither prediction was recorded.
+    assert!(!client.has_predicted(&market_id_1, &predictor));
+    assert!(!client.has_predicted(&market_id_2, &predictor));
+}
+
+#[test]
+fn test_submit_predictions_batch_rejects_above_max_stake() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, xlm_token, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+    let stake = 20_000_000_i128;
+
+    let market_id_1 = client.create_market(&Address::generate(&env), &default_params(&env));
+    let market_id_2 = client.create_market(&Address::generate(&env), &default_params(&env));
+    fund(&env, &xlm_token, &predictor, stake * 20);
+
+    let requests = vec![
+        &env,
+        BatchPredictionRequest {
+            market_id: market_id_1,
+            chosen_outcome: symbol_short!("yes"),
+            stake_amount: stake, // valid
+        },
+        BatchPredictionRequest {
+            market_id: market_id_2,
+            chosen_outcome: symbol_short!("yes"),
+            stake_amount: 100_000_001_i128, // above max_stake
+        },
+    ];
+
+    let result = client.try_submit_predictions_batch(&predictor, &requests);
+    assert!(matches!(result, Err(Ok(InsightArenaError::StakeTooHigh))));
+
+    assert!(!client.has_predicted(&market_id_1, &predictor));
+    assert!(!client.has_predicted(&market_id_2, &predictor));
+}
+
+#[test]
+fn test_submit_predictions_batch_enforces_resolved_bounds_in_range() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, xlm_token, admin, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    // Both markets inherit their bounds from the global config window.
+    client.set_stake_bounds(&admin, &15_000_000_i128, &30_000_000_i128);
+
+    let mut params = default_params(&env);
+    params.min_stake = 0;
+    params.max_stake = 0;
+    let market_id_1 = client.create_market(&Address::generate(&env), &params.clone());
+    let market_id_2 = client.create_market(&Address::generate(&env), &params);
+    fund(&env, &xlm_token, &predictor, 100_000_000);
+
+    // Below the resolved global min → StakeTooLow
+    let too_low = client.try_submit_predictions_batch(
+        &predictor,
+        &vec![
+            &env,
+            BatchPredictionRequest {
+                market_id: market_id_1,
+                chosen_outcome: symbol_short!("yes"),
+                stake_amount: 14_999_999_i128,
+            },
+        ],
+    );
+    assert!(matches!(too_low, Err(Ok(InsightArenaError::StakeTooLow))));
+
+    // Above the resolved global max → StakeTooHigh
+    let too_high = client.try_submit_predictions_batch(
+        &predictor,
+        &vec![
+            &env,
+            BatchPredictionRequest {
+                market_id: market_id_1,
+                chosen_outcome: symbol_short!("yes"),
+                stake_amount: 30_000_001_i128,
+            },
+        ],
+    );
+    assert!(matches!(too_high, Err(Ok(InsightArenaError::StakeTooHigh))));
+
+    // Boundary stakes within the resolved window succeed.
+    let requests = vec![
+        &env,
+        BatchPredictionRequest {
+            market_id: market_id_1,
+            chosen_outcome: symbol_short!("yes"),
+            stake_amount: 15_000_000_i128,
+        },
+        BatchPredictionRequest {
+            market_id: market_id_2,
+            chosen_outcome: symbol_short!("no"),
+            stake_amount: 30_000_000_i128,
+        },
+    ];
+    let result = client.submit_predictions_batch(&predictor, &requests);
+    assert_eq!(result.len(), 2);
+    assert!(client.has_predicted(&market_id_1, &predictor));
+    assert!(client.has_predicted(&market_id_2, &predictor));
+}
+
+#[test]
+fn test_reveal_prediction_rejects_below_min_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    // Bounds are checked before the commitment lookup, so no prior commit is
+    // needed to observe StakeTooLow.
+    let result = client.try_reveal_prediction(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &(params.min_stake - 1),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(matches!(result, Err(Ok(InsightArenaError::StakeTooLow))));
+}
+
+#[test]
+fn test_reveal_prediction_rejects_above_max_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    let result = client.try_reveal_prediction(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &(params.max_stake + 1),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(matches!(result, Err(Ok(InsightArenaError::StakeTooHigh))));
+}
+
+#[test]
+fn test_reveal_prediction_enforces_global_bounds_when_market_inherits() {
+    let env = Env::default();
+    let (client, xlm_token, admin, _) = deploy(&env);
+    // deploy() installs blanket mocks; re-mock so the predictor's nested
+    // require_auth is allowed alongside its top-level invocation frame.
+    env.mock_all_auths_allowing_non_root_auth();
+    let predictor = Address::generate(&env);
+
+    // Market inherits both bounds; without resolution the raw check would
+    // reject every positive stake against a zero max.
+    client.set_stake_bounds(&admin, &15_000_000_i128, &30_000_000_i128);
+    let mut params = default_params(&env);
+    params.min_stake = 0;
+    params.max_stake = 0;
+    let market_id = client.create_market(&Address::generate(&env), &params);
+    fund(&env, &xlm_token, &predictor, 100_000_000);
+
+    // Below the resolved global min → StakeTooLow
+    let too_low = client.try_reveal_prediction(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &14_999_999_i128,
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(matches!(too_low, Err(Ok(InsightArenaError::StakeTooLow))));
+
+    // Above the resolved global max → StakeTooHigh
+    let too_high = client.try_reveal_prediction(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &30_000_001_i128,
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(matches!(too_high, Err(Ok(InsightArenaError::StakeTooHigh))));
+
+    // In-range committed prediction reveals successfully.
+    let stake = 20_000_000_i128;
+    let hash = commitment_hash(&env, &symbol_short!("no"), stake);
+    client.commit_prediction(&predictor, &market_id, &hash, &60_u64);
+    env.ledger().with_mut(|li| li.timestamp += 61);
+    client.reveal_prediction(
+        &predictor,
+        &market_id,
+        &symbol_short!("no"),
+        &stake,
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(client.has_predicted(&market_id, &predictor));
+}
+
+#[test]
+fn test_submit_prediction_via_allowance_rejects_below_min_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    TokenClient::new(&env, &xlm_token).approve(
+        &predictor,
+        &client.address,
+        &100_000_000_i128,
+        &9999,
+    );
+
+    let result = client.try_submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &(params.min_stake - 1),
+    );
+    assert!(matches!(result, Err(Ok(InsightArenaError::StakeTooLow))));
+    assert!(!client.has_predicted(&market_id, &predictor));
+}
+
+#[test]
+fn test_submit_prediction_via_allowance_rejects_above_max_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    TokenClient::new(&env, &xlm_token).approve(
+        &predictor,
+        &client.address,
+        &200_000_000_i128,
+        &9999,
+    );
+
+    let result = client.try_submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &(params.max_stake + 1),
+    );
+    assert!(matches!(result, Err(Ok(InsightArenaError::StakeTooHigh))));
+    assert!(!client.has_predicted(&market_id, &predictor));
+}
+
+#[test]
+fn test_submit_prediction_via_allowance_enforces_global_bounds_when_market_inherits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, admin, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    client.set_stake_bounds(&admin, &15_000_000_i128, &30_000_000_i128);
+    let mut params = default_params(&env);
+    params.min_stake = 0;
+    params.max_stake = 0;
+    let market_id = client.create_market(&Address::generate(&env), &params);
+    fund(&env, &xlm_token, &predictor, 100_000_000);
+
+    TokenClient::new(&env, &xlm_token).approve(
+        &predictor,
+        &client.address,
+        &100_000_000_i128,
+        &9999,
+    );
+
+    // Below the resolved global min → StakeTooLow
+    let too_low = client.try_submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &14_999_999_i128,
+    );
+    assert!(matches!(too_low, Err(Ok(InsightArenaError::StakeTooLow))));
+
+    // Above the resolved global max → StakeTooHigh
+    let too_high = client.try_submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &30_000_001_i128,
+    );
+    assert!(matches!(too_high, Err(Ok(InsightArenaError::StakeTooHigh))));
+
+    // In-range submission succeeds and pulls funds via the allowance.
+    client.submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &20_000_000_i128,
+    );
+    assert!(client.has_predicted(&market_id, &predictor));
+    assert_eq!(
+        TokenClient::new(&env, &xlm_token).balance(&client.address),
+        20_000_000_i128
+    );
+}
+
+// ── submit_prediction_via_allowance – allowance sufficiency guard (AC-1/2/3) ─
+
+/// AC-1: An allowance smaller than the requested stake causes the call to
+/// revert with InsufficientFunds.
+/// AC-2: No Prediction record is created — has_predicted stays false after the
+/// reverted attempt, and pool totals / participant count are unchanged.
+#[test]
+fn test_submit_prediction_via_allowance_insufficient_allowance_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    let stake = params.min_stake; // 10_000_000 — valid amount
+
+    // Fund the predictor so balance is not the limiting factor.
+    fund(&env, &xlm_token, &predictor, stake);
+
+    // Approve one stroop less than the stake — insufficient.
+    TokenClient::new(&env, &xlm_token).approve(
+        &predictor,
+        &client.address,
+        &(stake - 1),
+        &9999,
+    );
+
+    // The call must revert with InsufficientFunds.
+    let result = client.try_submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &stake,
+    );
+    assert!(
+        matches!(result, Err(Ok(InsightArenaError::InsufficientFunds))),
+        "expected InsufficientFunds, got {:?}",
+        result,
+    );
+
+    // AC-2: no Prediction record written.
+    assert!(
+        !client.has_predicted(&market_id, &predictor),
+        "has_predicted must be false after a reverted allowance submission",
+    );
+
+    // The predictor's token balance must be untouched — no transfer occurred.
+    assert_eq!(
+        TokenClient::new(&env, &xlm_token).balance(&predictor),
+        stake,
+        "predictor balance must be unchanged after a reverted allowance submission",
+    );
+
+    // The contract escrow must be empty — nothing was deposited.
+    assert_eq!(
+        TokenClient::new(&env, &xlm_token).balance(&client.address),
+        0,
+        "contract escrow must be unchanged after a reverted allowance submission",
+    );
+}
+
+/// AC-2 (reinforced): after a failed allowance submission the predictor can
+/// fix their approval and successfully submit — confirming the contract state
+/// was fully clean after the earlier revert.
+#[test]
+fn test_submit_prediction_via_allowance_no_record_after_revert_then_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    let stake = params.min_stake;
+    fund(&env, &xlm_token, &predictor, stake);
+
+    // First attempt: allowance is 0 — must revert.
+    let result = client.try_submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &stake,
+    );
+    assert!(matches!(result, Err(Ok(InsightArenaError::InsufficientFunds))));
+    assert!(!client.has_predicted(&market_id, &predictor));
+
+    // Correct the approval and retry — must succeed.
+    TokenClient::new(&env, &xlm_token).approve(
+        &predictor,
+        &client.address,
+        &stake,
+        &9999,
+    );
+    client.submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &stake,
+    );
+    assert!(
+        client.has_predicted(&market_id, &predictor),
+        "has_predicted must be true after successful retry",
+    );
+}
+
+/// AC-3: An allowance exactly equal to the stake succeeds — the guard must not
+/// be overly strict (boundary case: allowance == stake_amount is sufficient).
+#[test]
+fn test_submit_prediction_via_allowance_exact_allowance_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm_token, _, _) = deploy(&env);
+    let predictor = Address::generate(&env);
+
+    let params = default_params(&env);
+    let market_id = client.create_market(&Address::generate(&env), &params);
+
+    let stake = params.min_stake;
+    fund(&env, &xlm_token, &predictor, stake);
+
+    // Approve exactly the stake — no more, no less.
+    TokenClient::new(&env, &xlm_token).approve(
+        &predictor,
+        &client.address,
+        &stake,
+        &9999,
+    );
+
+    // Must succeed without error.
+    client.submit_prediction_via_allowance(
+        &predictor,
+        &market_id,
+        &symbol_short!("yes"),
+        &stake,
+    );
+
+    assert!(
+        client.has_predicted(&market_id, &predictor),
+        "exact allowance == stake must succeed",
+    );
+
+    // Token balance transferred to contract escrow.
+    assert_eq!(
+        TokenClient::new(&env, &xlm_token).balance(&client.address),
+        stake,
+        "contract escrow must hold the staked amount",
+    );
 }

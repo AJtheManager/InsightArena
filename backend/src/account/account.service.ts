@@ -111,6 +111,22 @@ export class AccountService {
     }
   }
 
+  /**
+   * Related entity sections that must always be present in an export,
+   * even when the user has no activity in that category.
+   */
+  static readonly EXPORT_SECTIONS = [
+    'predictions',
+    'markets_created',
+    'notifications',
+    'achievements',
+    'bookmarks',
+    'follows',
+    'followers',
+    'competitions',
+    'leaderboard_history',
+  ] as const;
+
   private async gatherUserData(
     userId: string,
   ): Promise<Record<string, unknown>> {
@@ -129,6 +145,7 @@ export class AccountService {
       achievements,
       bookmarks,
       follows,
+      followers,
       competitions,
       leaderboard,
       notifications,
@@ -147,7 +164,11 @@ export class AccountService {
         userId,
       ]),
       this.dataSource.query(
-        `SELECT * FROM user_follows WHERE follower_id = $1 OR following_id = $1`,
+        `SELECT * FROM user_follows WHERE follower_id = $1`,
+        [userId],
+      ),
+      this.dataSource.query(
+        `SELECT * FROM user_follows WHERE following_id = $1`,
         [userId],
       ),
       this.dataSource.query(
@@ -168,14 +189,15 @@ export class AccountService {
     return {
       exported_at: new Date().toISOString(),
       profile,
-      predictions,
-      markets_created: markets,
-      notifications,
-      achievements,
-      bookmarks,
-      follows,
-      competitions,
-      leaderboard_history: leaderboard,
+      predictions: predictions ?? [],
+      markets_created: markets ?? [],
+      notifications: notifications ?? [],
+      achievements: achievements ?? [],
+      bookmarks: bookmarks ?? [],
+      follows: follows ?? [],
+      followers: followers ?? [],
+      competitions: competitions ?? [],
+      leaderboard_history: leaderboard ?? [],
     };
   }
 

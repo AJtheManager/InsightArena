@@ -6,7 +6,12 @@ import { LeaderboardModule } from '../leaderboard/leaderboard.module';
 import { CacheWarmingService } from './warming.service';
 
 @Module({
-  imports: [CacheModule.register(), MarketsModule, AnalyticsModule, forwardRef(() => LeaderboardModule)],
+  imports: [
+    CacheModule.register(),
+    MarketsModule,
+    AnalyticsModule,
+    forwardRef(() => LeaderboardModule),
+  ],
   providers: [CacheWarmingService],
   exports: [CacheWarmingService],
 })

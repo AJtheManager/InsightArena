@@ -5,7 +5,7 @@ import axios from 'axios';
 import { FxRateService, BASE_CURRENCY } from './fx-rate.service';
 
 jest.mock('axios');
-const mockedAxios = axios as jest.Mocked<typeof axios>;
+const mockedAxios = axios;
 
 describe('FxRateService', () => {
   let service: FxRateService;
@@ -30,7 +30,11 @@ describe('FxRateService', () => {
 
   describe('getRates', () => {
     it('returns cached rates without fetching', async () => {
-      const cached = { base: BASE_CURRENCY, rates: { USD: 0.1 }, fetched_at: '' };
+      const cached = {
+        base: BASE_CURRENCY,
+        rates: { USD: 0.1 },
+        fetched_at: '',
+      };
       cacheManager.get.mockResolvedValue(cached);
 
       const result = await service.getRates();
@@ -41,7 +45,9 @@ describe('FxRateService', () => {
 
     it('fetches, caches, and returns rates on cache miss', async () => {
       cacheManager.get.mockResolvedValue(null);
-      mockedAxios.get.mockResolvedValue({ data: { rates: { USD: 0.1, EUR: 0.09 } } });
+      mockedAxios.get.mockResolvedValue({
+        data: { rates: { USD: 0.1, EUR: 0.09 } },
+      });
 
       const result = await service.getRates();
 

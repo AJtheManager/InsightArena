@@ -1892,3 +1892,234 @@ fn market_created_event_includes_metadata_hash() {
     assert!(found, "market created event must include metadata_hash");
     assert_eq!(client.get_metadata_hash(&id), metadata_hash);
 }
+
+#[test]
+fn test_create_market_fails_exceeds_max_outcomes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let creator = Address::generate(&env);
+
+    let mut params = default_params(&env);
+    params.outcomes = vec![
+        &env,
+        Symbol::new(&env, "opt1"),
+        Symbol::new(&env, "opt2"),
+        Symbol::new(&env, "opt3"),
+        Symbol::new(&env, "opt4"),
+        Symbol::new(&env, "opt5"),
+        Symbol::new(&env, "opt6"),
+        Symbol::new(&env, "opt7"),
+        Symbol::new(&env, "opt8"),
+        Symbol::new(&env, "opt9"),
+        Symbol::new(&env, "opt10"),
+        Symbol::new(&env, "opt11"),
+    ];
+
+    let result = client.try_create_market(&creator, &params);
+    assert!(matches!(result, Err(Ok(InsightArenaError::InvalidInput))));
+}
+
+#[test]
+fn test_3way_market_end_to_end() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, oracle, xlm_token) = deploy_with_token(&env);
+    let creator = Address::generate(&env);
+
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+    let user_c = Address::generate(&env);
+    let user_d = Address::generate(&env);
+
+    fund(&env, &xlm_token, &user_a, 100_000_000);
+    fund(&env, &xlm_token, &user_b, 200_000_000);
+    fund(&env, &xlm_token, &user_c, 300_000_000);
+    fund(&env, &xlm_token, &user_d, 100_000_000);
+
+    let mut params = default_params(&env);
+    params.max_stake = 500_000_000;
+    let opt_a = Symbol::new(&env, "team_a");
+    let opt_b = Symbol::new(&env, "team_b");
+    let opt_draw = Symbol::new(&env, "draw");
+    params.outcomes = vec![&env, opt_a.clone(), opt_b.clone(), opt_draw.clone()];
+    params.creator_fee_bps = 0;
+
+    let market_id = client.create_market(&creator, &params);
+    assert_eq!(market_id, 1);
+
+    client.submit_prediction(&user_a, &market_id, &opt_a, &100_000_000);
+    client.submit_prediction(&user_b, &market_id, &opt_b, &200_000_000);
+    client.submit_prediction(&user_c, &market_id, &opt_draw, &300_000_000);
+    client.submit_prediction(&user_d, &market_id, &opt_a, &100_000_000);
+
+    let market = client.get_market(&market_id);
+    assert_eq!(market.total_pool, 700_000_000);
+    assert_eq!(market.participant_count, 4);
+
+    let dist = client.get_outcome_distribution(&market_id);
+    assert_eq!(dist.len(), 3);
+
+    env.ledger().set_timestamp(params.resolution_time + 1);
+
+    client.resolve_market(&oracle, &market_id, &opt_a);
+
+    let market_resolved = client.get_market(&market_id);
+    assert!(market_resolved.is_resolved);
+    assert_eq!(market_resolved.resolved_outcome, Some(opt_a.clone()));
+
+    let payout_a = client.claim_payout(&user_a, &market_id);
+    let payout_d = client.claim_payout(&user_d, &market_id);
+
+    assert_eq!(payout_a, 343_000_000);
+    assert_eq!(payout_d, 343_000_000);
+
+    let err_b = client.try_claim_payout(&user_b, &market_id);
+    assert!(matches!(err_b, Err(Ok(InsightArenaError::InvalidOutcome))));
+}
+
+#[test]
+fn test_nway_market_5_outcomes_end_to_end() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, oracle, xlm_token) = deploy_with_token(&env);
+    let creator = Address::generate(&env);
+
+    let mut params = default_params(&env);
+    params.creator_fee_bps = 0;
+    params.outcomes = vec![
+        &env,
+        Symbol::new(&env, "opt1"),
+        Symbol::new(&env, "opt2"),
+        Symbol::new(&env, "opt3"),
+        Symbol::new(&env, "opt4"),
+        Symbol::new(&env, "opt5"),
+    ];
+
+    let market_id = client.create_market(&creator, &params);
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    fund(&env, &xlm_token, &u1, 50_000_000);
+    fund(&env, &xlm_token, &u2, 50_000_000);
+
+    let winning_outcome = Symbol::new(&env, "opt3");
+    let losing_outcome = Symbol::new(&env, "opt5");
+
+    client.submit_prediction(&u1, &market_id, &winning_outcome, &50_000_000);
+    client.submit_prediction(&u2, &market_id, &losing_outcome, &50_000_000);
+
+    env.ledger().set_timestamp(params.resolution_time + 1);
+    client.resolve_market(&oracle, &market_id, &winning_outcome);
+
+    let payout1 = client.claim_payout(&u1, &market_id);
+    assert_eq!(payout1, 98_000_000);
+
+    let err2 = client.try_claim_payout(&u2, &market_id);
+    assert!(matches!(err2, Err(Ok(InsightArenaError::InvalidOutcome))));
+}
+
+// ── Reputation gate — market_tests.rs (AC-1 / AC-2 / AC-4) ──────────────────
+//
+// These tests exercise the reputation gate that lives inside create_market
+// (Guard 6 in market.rs). AC-3 (MarketCreationDenied event) is covered by
+// denial_emits_event_with_attempted_creator in reputation_tests.rs, which
+// runs in a binary where Soroban's test SDK reliably captures failed-call
+// events.
+
+/// AC-1 + AC-2: a creator whose reputation score is 0 and who is NOT on the
+/// trusted-creator allowlist is rejected with InsufficientReputation, no
+/// market record is written, and the market counter stays at 0.
+#[test]
+fn create_market_denied_writes_no_state_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _oracle) = deploy_with_actors(&env);
+    let creator = Address::generate(&env);
+
+    // Raise threshold above a brand-new creator's score of 0.
+    client.set_min_creator_reputation(&admin, &1_u32);
+
+    // Must fail with InsufficientReputation.
+    let result = client.try_create_market(&creator, &default_params(&env));
+    assert!(
+        matches!(result, Err(Ok(InsightArenaError::InsufficientReputation))),
+        "expected InsufficientReputation, got {:?}",
+        result
+    );
+
+    // AC-2: no state written — counter stays at 0, no market record exists.
+    assert_eq!(
+        client.get_market_count(),
+        0,
+        "market counter must remain 0 after a denied create_market"
+    );
+    assert!(
+        matches!(
+            client.try_get_market(&1_u64),
+            Err(Ok(InsightArenaError::MarketNotFound))
+        ),
+        "market ID 1 must not exist after a denied create_market"
+    );
+}
+
+/// AC-1 + AC-4 (allowlist path): a creator on the trusted-creator allowlist
+/// succeeds even when their reputation score is 0 and the threshold is 1000.
+/// The market is persisted and the counter increments.
+#[test]
+fn create_market_allowed_for_trusted_creator_regardless_of_score() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _oracle) = deploy_with_actors(&env);
+    let creator = Address::generate(&env);
+
+    client.set_min_creator_reputation(&admin, &1_000_u32);
+    client.add_trusted_creator(&admin, &creator);
+
+    let result = client.try_create_market(&creator, &default_params(&env));
+    assert!(
+        result.is_ok(),
+        "trusted creator must be allowed to create a market regardless of score"
+    );
+
+    assert_eq!(client.get_market_count(), 1);
+    assert_eq!(client.get_market(&1_u64).creator, creator);
+}
+
+/// AC-1 + AC-4 (reputation path): a creator who meets min_creator_reputation
+/// directly — without being on the allowlist — is also allowed. Confirms the
+/// OR logic works in both directions.
+#[test]
+fn create_market_allowed_when_reputation_meets_threshold_directly() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, oracle) = deploy_with_actors(&env);
+    let creator = Address::generate(&env);
+
+    // Build score of 600: create a market, advance past resolution_time, resolve.
+    let seed_params = default_params(&env);
+    let resolution_time = seed_params.resolution_time;
+    let seed_id = client.create_market(&creator, &seed_params);
+    env.ledger().set_timestamp(resolution_time + 1);
+    client.resolve_market(&oracle, &seed_id, &symbol_short!("yes"));
+    assert_eq!(client.get_reputation_score(&creator), 600);
+
+    // Set threshold to exactly 600 — score meets it.
+    client.set_min_creator_reputation(&admin, &600_u32);
+
+    // NOT on the allowlist.
+    assert!(!client.is_trusted_creator(&creator));
+
+    // Build params relative to the now-advanced ledger timestamp.
+    let now = env.ledger().timestamp();
+    let mut params = default_params(&env);
+    params.end_time = now + 1000;
+    params.resolution_time = now + 2000;
+
+    let result = client.try_create_market(&creator, &params);
+    assert!(
+        result.is_ok(),
+        "creator whose score meets the threshold must succeed without being on the allowlist"
+    );
+    assert_eq!(client.get_market_count(), 2);
+}

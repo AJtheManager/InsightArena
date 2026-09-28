@@ -2,7 +2,7 @@ use soroban_sdk::{Address, Env, Symbol};
 
 use crate::admin;
 use crate::storage::{self, TTL_LEDGERS};
-use crate::storage_types::{CreatorVestingSchedule, DataKey};
+use crate::storage_types::{CreatorVestingSchedule, DataKey, MAX_FEE_BPS};
 use crate::token::TokenHelper;
 
 /// Errors for fee module operations.
@@ -25,6 +25,33 @@ pub enum FeeError {
     /// `claim_vested_revenue` called before any additional amount has
     /// unlocked since the last claim.
     NothingToClaim = 10,
+    /// A fee/share computation overflowed `i128` — guards against corrupt or
+    /// adversarial inputs on very large pools rather than panicking.
+    Overflow = 11,
+}
+
+/// Compute `amount * share_bps / MAX_FEE_BPS` using checked arithmetic.
+///
+/// This is the single bounded, overflow-safe fee/share calculation used
+/// throughout the contract (e.g. splitting a creator's leftover prize-pool
+/// revenue into an immediate payout and a vested portion). `share_bps` must
+/// already have been validated to be `<= MAX_FEE_BPS` by the caller (see
+/// [`set_creator_vesting_config`]) — this function additionally re-checks the
+/// bound defensively and rejects it with [`FeeError::InvalidConfig`].
+///
+/// # Errors
+/// * [`FeeError::InvalidConfig`] — `share_bps > MAX_FEE_BPS`.
+/// * [`FeeError::Overflow`] — the multiplication overflowed `i128` (only
+///   possible for pathologically large `amount` values).
+pub fn calculate_bounded_fee(amount: i128, share_bps: u32) -> Result<i128, FeeError> {
+    if share_bps > MAX_FEE_BPS {
+        return Err(FeeError::InvalidConfig);
+    }
+
+    amount
+        .checked_mul(share_bps as i128)
+        .and_then(|scaled| scaled.checked_div(MAX_FEE_BPS as i128))
+        .ok_or(FeeError::Overflow)
 }
 
 /// Return the XLM balance of the configured treasury address.
@@ -137,7 +164,7 @@ pub fn set_creator_vesting_config(
 ) -> Result<(), FeeError> {
     require_is_admin(env, &caller)?;
 
-    if vest_share_bps > 10_000 {
+    if vest_share_bps > MAX_FEE_BPS {
         return Err(FeeError::InvalidConfig);
     }
 
@@ -192,41 +219,56 @@ fn unlocked_amount(schedule: &CreatorVestingSchedule, now: u64) -> i128 {
 /// their last claim. Only the allocated creator may claim their own
 /// schedule. Callable repeatedly as more of the schedule unlocks.
 ///
+/// # Behavior
+/// * Before any vesting time has elapsed (`now <= start_time`), nothing has
+///   unlocked, so this is a well-defined no-op: it returns `Ok(0)` and does
+///   not mutate the schedule or emit a payout event. It never panics.
+/// * After partial vesting, only the proportionally vested amount is released;
+///   the remainder stays claimable on later calls.
+/// * Once fully vested, the remainder is released exactly once; subsequent
+///   calls return [`FeeError::AlreadySettled`] (no double payout).
+///
 /// # Errors
 /// * [`FeeError::NoVestingSchedule`] — no schedule exists for this (creator, event_id).
 /// * [`FeeError::AlreadySettled`] — the schedule already reached a terminal state.
-/// * [`FeeError::NothingToClaim`] — no additional amount has unlocked yet.
 /// * [`FeeError::TransferFailed`] — the payout transfer failed.
 ///
 /// # Events
 /// Emits `(Symbol("creator"), Symbol("vested_claimed"))` with data
-/// `(event_id, creator, amount)`.
+/// `(event_id, creator, amount)` when a non-zero amount is released.
 pub fn claim_vested_revenue(env: &Env, creator: Address, event_id: u64) -> Result<i128, FeeError> {
     creator.require_auth();
 
-    let mut schedule =
-        storage::get_creator_vesting(env, &creator, event_id).ok_or(FeeError::NoVestingSchedule)?;
+    let mut schedule = storage::get_creator_vesting(env, &creator, event_id)
+        .ok_or(FeeError::NoVestingSchedule)?;
 
-    if schedule.settled {
+    if schedule.claimed >= schedule.total_amount {
         return Err(FeeError::AlreadySettled);
     }
 
     let now = env.ledger().timestamp();
     let unlocked = unlocked_amount(&schedule, now);
-    let claimable = unlocked - schedule.claimed_amount;
+    let claimable = unlocked - schedule.claimed;
+
+    // Nothing has vested yet (or nothing new since the last claim): a
+    // well-defined no-op rather than a panic or a zero-value transfer.
     if claimable <= 0 {
-        return Err(FeeError::NothingToClaim);
+        return Ok(0);
     }
 
     let xlm_token = admin::get_xlm_token(env).unwrap_or_else(|| panic!("not_initialized"));
-    TokenHelper::distribute_winnings(env, &xlm_token, &creator, claimable)
-        .map_err(|_| FeeError::TransferFailed)?;
+    let treasury = admin::get_treasury(env).unwrap_or_else(|| panic!("not_initialized"));
 
-    schedule.claimed_amount += claimable;
-    if schedule.claimed_amount >= schedule.total_amount {
-        schedule.settled = true;
-    }
-    storage::set_creator_vesting(env, &schedule);
+    TokenHelper::transfer_from(env, &xlm_token, &treasury, &creator, claimable).map_err(
+        |err| match err {
+            crate::token::TokenError::InsufficientBalance => FeeError::InsufficientBalance,
+            crate::token::TokenError::TransferFailed => FeeError::TransferFailed,
+            _ => FeeError::TransferFailed,
+        },
+    )?;
+
+    schedule.claimed += claimable;
+    storage::set_creator_vesting(env, &creator, event_id, &schedule);
 
     env.events().publish(
         (
@@ -237,55 +279,4 @@ pub fn claim_vested_revenue(env: &Env, creator: Address, event_id: u64) -> Resul
     );
 
     Ok(claimable)
-}
-
-/// Forfeit the unclaimed remainder of a creator's vesting schedule — e.g.
-/// when the event's finalization is later invalidated — sweeping it to
-/// treasury and settling the schedule. Only the admin may call this.
-///
-/// # Errors
-/// * [`FeeError::Unauthorized`] — caller is not the admin.
-/// * [`FeeError::NoVestingSchedule`] — no schedule exists for this (creator, event_id).
-/// * [`FeeError::AlreadySettled`] — the schedule already reached a terminal state.
-/// * [`FeeError::TransferFailed`] — the treasury sweep transfer failed.
-///
-/// # Events
-/// Emits `(Symbol("creator"), Symbol("vesting_forfeited"))` with data
-/// `(event_id, creator, forfeited_amount)`.
-pub fn forfeit_creator_vesting(
-    env: &Env,
-    caller: Address,
-    creator: Address,
-    event_id: u64,
-) -> Result<i128, FeeError> {
-    require_is_admin(env, &caller)?;
-
-    let mut schedule =
-        storage::get_creator_vesting(env, &creator, event_id).ok_or(FeeError::NoVestingSchedule)?;
-
-    if schedule.settled {
-        return Err(FeeError::AlreadySettled);
-    }
-
-    let remaining = schedule.total_amount - schedule.claimed_amount;
-    schedule.forfeited_amount += remaining;
-    schedule.settled = true;
-    storage::set_creator_vesting(env, &schedule);
-
-    if remaining > 0 {
-        let treasury = admin::get_treasury(env).unwrap_or_else(|| panic!("not_initialized"));
-        let xlm_token = admin::get_xlm_token(env).unwrap_or_else(|| panic!("not_initialized"));
-        TokenHelper::distribute_winnings(env, &xlm_token, &treasury, remaining)
-            .map_err(|_| FeeError::TransferFailed)?;
-    }
-
-    env.events().publish(
-        (
-            Symbol::new(env, "creator"),
-            Symbol::new(env, "vesting_forfeited"),
-        ),
-        (event_id, creator, remaining),
-    );
-
-    Ok(remaining)
 }

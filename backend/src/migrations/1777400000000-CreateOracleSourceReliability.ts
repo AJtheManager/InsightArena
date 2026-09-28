@@ -1,8 +1,6 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
-export class CreateOracleSourceReliability1777400000000
-  implements MigrationInterface
-{
+export class CreateOracleSourceReliability1777400000000 implements MigrationInterface {
   async up(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.query(`
       CREATE TABLE "oracle_source_reliability" (

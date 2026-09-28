@@ -3,6 +3,8 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Inject,
   Injectable,
   Logger,
@@ -37,13 +39,23 @@ import {
   TrendingMarketsQueryDto,
 } from './dto/trending-markets.dto';
 import { Comment } from './entities/comment.entity';
+import { moderateCommentContent } from '../common/comment-moderation.util';
 import { MarketTemplate } from './entities/market-template.entity';
 import { Market, MarketSettlementState } from './entities/market.entity';
+import {
+  canTransition,
+  describeIllegalTransition,
+} from './market-settlement-state.util';
 import { UserBookmark } from './entities/user-bookmark.entity';
 import { MarketPriceSnapshot } from './entities/market-price-snapshot.entity';
 import { Prediction } from '../predictions/entities/prediction.entity';
 import { WebhookDispatcherService } from '../webhooks/services/webhook-dispatcher.service';
-import { PriceHistoryQueryDto, TimeRange, Interval } from './dto/price-history-query.dto';
+import { SearchService } from '../search/search.service';
+import {
+  PriceHistoryQueryDto,
+  TimeRange,
+  Interval,
+} from './dto/price-history-query.dto';
 
 @Injectable()
 export class MarketsService {
@@ -77,6 +89,7 @@ export class MarketsService {
     private readonly sorobanService: SorobanService,
     private readonly dataSource: DataSource,
     private readonly webhookDispatcher: WebhookDispatcherService,
+    private readonly searchService: SearchService,
     @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
     @Inject(forwardRef(() => MarketSettlementScheduler))
     private readonly settlementScheduler: MarketSettlementScheduler,
@@ -167,7 +180,8 @@ export class MarketsService {
     const { timeRange, interval } = query;
     const market = await this.findByIdOrOnChainId(marketId);
 
-    const qb = this.priceSnapshotRepository.createQueryBuilder('snapshot')
+    const qb = this.priceSnapshotRepository
+      .createQueryBuilder('snapshot')
       .where('snapshot.market_id = :marketId', { marketId: market.id });
 
     if (timeRange !== TimeRange.ALL) {
@@ -176,7 +190,7 @@ export class MarketsService {
       if (timeRange === TimeRange.ONE_DAY) intervalStr = '1 day';
       if (timeRange === TimeRange.SEVEN_DAYS) intervalStr = '7 days';
       if (timeRange === TimeRange.THIRTY_DAYS) intervalStr = '30 days';
-      
+
       qb.andWhere(`snapshot.created_at >= NOW() - INTERVAL '${intervalStr}'`);
     }
 
@@ -194,8 +208,8 @@ export class MarketsService {
       .addOrderBy('snapshot.outcome_index', 'ASC');
 
     const results = await qb.getRawMany();
-    
-    return results.map(row => ({
+
+    return results.map((row) => ({
       timestamp: row.timestamp,
       outcome_index: row.outcome_index,
       price: Number(row.price),
@@ -205,7 +219,11 @@ export class MarketsService {
   /**
    * Internal helper to record a new price point for an outcome
    */
-  async snapshotPrice(marketId: string, outcomeIndex: number, price: number): Promise<void> {
+  async snapshotPrice(
+    marketId: string,
+    outcomeIndex: number,
+    price: number,
+  ): Promise<void> {
     const snapshot = this.priceSnapshotRepository.create({
       market_id: marketId,
       outcome_index: outcomeIndex,
@@ -465,6 +483,11 @@ export class MarketsService {
 
     const saved = await this.marketsRepository.save(market);
     await this.invalidateMarketCaches(saved.id);
+
+    if (dto.title !== undefined || dto.description !== undefined) {
+      await this.searchService.refreshMarketSearchVector(saved.id);
+    }
+
     return saved;
   }
 
@@ -545,9 +568,14 @@ export class MarketsService {
       throw new ConflictException('Market is already resolved');
     }
 
-    if (market.settlement_state !== MarketSettlementState.PENDING) {
+    if (
+      !canTransition(market.settlement_state, MarketSettlementState.PROPOSED)
+    ) {
       throw new ConflictException(
-        `Cannot propose a resolution while market is in "${market.settlement_state}" state`,
+        describeIllegalTransition(
+          market.settlement_state,
+          MarketSettlementState.PROPOSED,
+        ),
       );
     }
 
@@ -597,9 +625,14 @@ export class MarketsService {
   ): Promise<Market> {
     const market = await this.findByIdOrOnChainId(id);
 
-    if (market.settlement_state !== MarketSettlementState.PROPOSED) {
+    if (
+      !canTransition(market.settlement_state, MarketSettlementState.CHALLENGED)
+    ) {
       throw new BadRequestException(
-        'Market does not have a resolution pending challenge',
+        describeIllegalTransition(
+          market.settlement_state,
+          MarketSettlementState.CHALLENGED,
+        ),
       );
     }
 
@@ -641,8 +674,15 @@ export class MarketsService {
 
     const market = await this.findByIdOrOnChainId(id);
 
-    if (market.settlement_state !== MarketSettlementState.CHALLENGED) {
-      throw new BadRequestException('Market does not have an active challenge');
+    if (
+      !canTransition(market.settlement_state, MarketSettlementState.SETTLED)
+    ) {
+      throw new BadRequestException(
+        describeIllegalTransition(
+          market.settlement_state,
+          MarketSettlementState.SETTLED,
+        ),
+      );
     }
 
     if (!market.outcome_options.includes(dto.outcome)) {
@@ -907,6 +947,9 @@ export class MarketsService {
     }
   }
 
+  /** Minimum time a user must wait between posting comments. */
+  private static readonly COMMENT_MIN_INTERVAL_MS = 10_000;
+
   /**
    * Create a comment for a market
    */
@@ -916,6 +959,20 @@ export class MarketsService {
     user: User,
   ): Promise<Comment> {
     const market = await this.findByIdOrOnChainId(marketId);
+
+    const lastComment = await this.commentsRepository.findOne({
+      where: { author: { id: user.id } },
+      order: { created_at: 'DESC' },
+    });
+    if (lastComment) {
+      const elapsedMs = Date.now() - lastComment.created_at.getTime();
+      if (elapsedMs < MarketsService.COMMENT_MIN_INTERVAL_MS) {
+        throw new HttpException(
+          'You are posting comments too quickly. Please wait before posting again.',
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+    }
 
     let parent: Comment | null = null;
     if (dto.parentId) {
@@ -929,11 +986,15 @@ export class MarketsService {
       }
     }
 
+    const { flagged, reason } = moderateCommentContent(dto.content);
+
     const comment = this.commentsRepository.create({
       content: dto.content,
       author: user,
       market,
       parent: parent || undefined,
+      is_flagged: flagged,
+      flagged_reason: reason,
     });
 
     return await this.commentsRepository.save(comment);
@@ -959,7 +1020,7 @@ export class MarketsService {
     const skip = (page - 1) * take;
 
     const [data, total] = await this.commentsRepository.findAndCount({
-      where: { market: { id: market.id } },
+      where: { market: { id: market.id }, is_flagged: false },
       relations: ['author', 'parent'],
       order: { created_at: 'ASC' },
       skip,

@@ -9,7 +9,8 @@
 /// - Permissionless: a random caller can finalize
 use creator_event_manager::storage;
 use creator_event_manager::storage_types::{
-    MatchResult, FINALIZATION_BOND_STROOPS, FINALIZATION_CHALLENGE_WINDOW_SECONDS,
+    MatchResult, CLAIM_PERIOD_SECONDS, FINALIZATION_BOND_STROOPS,
+    FINALIZATION_CHALLENGE_WINDOW_SECONDS,
 };
 use creator_event_manager::CreatorEventManagerContractClient;
 use soroban_sdk::testutils::Address as _;
@@ -143,6 +144,37 @@ fn reward_dist(env: &Env, percents: &[u32]) -> Vec<u32> {
         v.push_back(*p);
     }
     v
+}
+
+fn finalize_single_winner_event(
+    env: &Env,
+    client: &CreatorEventManagerContractClient<'static>,
+    contract_id: &Address,
+    creator: &Address,
+    ai_agent: &Address,
+    xlm_token: &Address,
+) -> (u64, Address) {
+    let dist = reward_dist(env, &[100]);
+    let (event_id, invite_code, match_ids) =
+        create_funded_event(env, contract_id, client, creator, xlm_token, PRIZE, dist, 1);
+
+    let winner = Address::generate(env);
+    client.join_event(&winner, &invite_code);
+    client.submit_prediction(&winner, &match_ids.get(0).unwrap(), &1u32, &0u32);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 7300);
+    submit_result(
+        client,
+        ai_agent,
+        match_ids.get(0).unwrap(),
+        MatchResult::TeamA,
+    );
+
+    let finalizer = Address::generate(env);
+    fund_finalizer_bond(env, xlm_token, &finalizer);
+    client.finalize_event(&finalizer, &event_id);
+
+    (event_id, winner)
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +687,42 @@ fn test_get_event_payouts_after_finalization_returns_correct_entries() {
 }
 
 #[test]
+fn test_clawback_immediately_after_finalize_is_rejected_without_changing_payouts() {
+    let (env, client, contract_id, creator, ai_agent, xlm_token) = setup();
+    let (event_id, _winner) =
+        finalize_single_winner_event(&env, &client, &contract_id, &creator, &ai_agent, &xlm_token);
+
+    let payouts_before = client.get_event_payouts(&event_id);
+    let caller = Address::generate(&env);
+    assert!(client.try_clawback_unclaimed(&caller, &event_id).is_err());
+
+    assert_eq!(client.get_event_payouts(&event_id), payouts_before);
+    assert_eq!(
+        balance(&env, &xlm_token, &contract_id),
+        PRIZE + FINALIZATION_BOND_STROOPS
+    );
+}
+
+#[test]
+fn test_clawback_succeeds_at_claim_deadline_with_unclaimed_prize() {
+    let (env, client, contract_id, creator, ai_agent, xlm_token) = setup();
+    let (event_id, winner) =
+        finalize_single_winner_event(&env, &client, &contract_id, &creator, &ai_agent, &xlm_token);
+
+    assert_eq!(balance(&env, &xlm_token, &winner), 0);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + CLAIM_PERIOD_SECONDS);
+
+    let caller = Address::generate(&env);
+    assert_eq!(client.clawback_unclaimed(&caller, &event_id), PRIZE);
+    assert_eq!(
+        balance(&env, &xlm_token, &contract_id),
+        FINALIZATION_BOND_STROOPS
+    );
+    assert_eq!(client.get_event_payouts(&event_id).len(), 1);
+}
+
+#[test]
 fn test_finalize_event_permissionless() {
     let (env, client, contract_id, creator, ai_agent, xlm_token) = setup();
 
@@ -914,6 +982,42 @@ fn test_unchallenged_finalization_returns_bond_after_window() {
 }
 
 #[test]
+#[should_panic(expected = "bond_already_settled")]
+fn test_returned_finalization_bond_cannot_be_settled_twice() {
+    let (env, client, contract_id, creator, ai_agent, xlm_token) = setup();
+    let dist = reward_dist(&env, &[100]);
+    let (event_id, invite_code, match_ids) = create_funded_event(
+        &env,
+        &contract_id,
+        &client,
+        &creator,
+        &xlm_token,
+        PRIZE,
+        dist,
+        1,
+    );
+    let user = Address::generate(&env);
+    client.join_event(&user, &invite_code);
+    client.submit_prediction(&user, &match_ids.get(0).unwrap(), &1u32, &0u32);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 7300);
+    submit_result(
+        &client,
+        &ai_agent,
+        match_ids.get(0).unwrap(),
+        MatchResult::TeamA,
+    );
+
+    let caller = Address::generate(&env);
+    fund_finalizer_bond(&env, &xlm_token, &caller);
+    client.finalize_event(&caller, &event_id);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + FINALIZATION_CHALLENGE_WINDOW_SECONDS + 1);
+
+    client.settle_finalization_bond(&caller, &event_id);
+    client.settle_finalization_bond(&caller, &event_id);
+}
+
+#[test]
 fn test_successful_challenge_slashes_bond_to_treasury() {
     let (env, client, contract_id, admin, ai_agent, xlm_token) = setup();
     let treasury = client.get_treasury();
@@ -955,6 +1059,49 @@ fn test_successful_challenge_slashes_bond_to_treasury() {
     let bond = client.get_finalization_bond(&event_id);
     assert!(bond.challenged);
     assert!(bond.settled);
+}
+
+#[test]
+#[should_panic(expected = "bond_already_settled")]
+fn test_slashed_finalization_bond_cannot_be_settled_again() {
+    let (env, client, contract_id, admin, ai_agent, xlm_token) = setup();
+    let treasury = client.get_treasury();
+    let dist = reward_dist(&env, &[100]);
+    let creator = Address::generate(&env);
+    let (event_id, invite_code, match_ids) = create_funded_event(
+        &env,
+        &contract_id,
+        &client,
+        &creator,
+        &xlm_token,
+        PRIZE,
+        dist,
+        1,
+    );
+    let user = Address::generate(&env);
+    client.join_event(&user, &invite_code);
+    client.submit_prediction(&user, &match_ids.get(0).unwrap(), &1u32, &0u32);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 7300);
+    submit_result(
+        &client,
+        &ai_agent,
+        match_ids.get(0).unwrap(),
+        MatchResult::TeamA,
+    );
+
+    let finalizer = Address::generate(&env);
+    fund_finalizer_bond(&env, &xlm_token, &finalizer);
+    client.finalize_event(&finalizer, &event_id);
+    let treasury_before = balance(&env, &xlm_token, &treasury);
+    client.challenge_finalization(&admin, &event_id);
+
+    assert_eq!(
+        balance(&env, &xlm_token, &treasury),
+        treasury_before + FINALIZATION_BOND_STROOPS
+    );
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + FINALIZATION_CHALLENGE_WINDOW_SECONDS + 1);
+    client.settle_finalization_bond(&admin, &event_id);
 }
 
 #[test]

@@ -312,6 +312,20 @@ fn test_finalize_season_reward_distribution() {
     env.ledger().set_timestamp(100);
     client.finalize_season(&admin, &season_id);
 
+    // Rewards are now vested in tranches (#1333) instead of paid out
+    // immediately. Advance past the whole vesting schedule and claim
+    // everything in one call per recipient so the balance assertions below
+    // still reflect the full awarded amount.
+    let cfg = client.get_config();
+    env.ledger().set_timestamp(
+        100 + (cfg.vesting_tranche_count as u64) * cfg.vesting_interval_seconds + 1,
+    );
+    for entry in entries.iter() {
+        if entry.rank <= 10 {
+            client.claim_vested_reward(&entry.user, &season_id);
+        }
+    }
+
     let token_client = TokenClient::new(&env, &xlm_token);
     let top_user = entries.get(0).unwrap().user;
     let second_user = entries.get(1).unwrap().user;
@@ -844,7 +858,9 @@ fn test_season_overlap_fully_contained_fails() {
 
 #[test]
 fn test_season_overlap_touching_at_start_succeeds() {
-    // S1=[100,200], S2=[50,100]: S2 ends exactly at S1's start → allow (no overlap)
+    // S1=[100,200], S2=[50,100]: S2 ends exactly at S1's start → allow (no overlap).
+    // This codebase uses half-open intervals [start, end): touching at a boundary
+    // is NOT an overlap, so adjacent seasons must be permitted.
     let env = Env::default();
     let (client, xlm_token, admin, _oracle) = deploy(&env);
 
@@ -856,6 +872,55 @@ fn test_season_overlap_touching_at_start_succeeds() {
 
     let season2_id = client.create_season(&admin, &50, &100, &100_000_000);
     assert_eq!(season2_id, 2);
+}
+
+#[test]
+fn test_season_overlap_touching_at_end_succeeds() {
+    // S1=[100,200], S2=[200,300]: S2 starts exactly at S1's end → allow (no overlap).
+    // Symmetrical boundary case: new season starting exactly when an existing live
+    // season ends must be permitted under the half-open interval convention.
+    let env = Env::default();
+    let (client, xlm_token, admin, _oracle) = deploy(&env);
+
+    fund(&env, &xlm_token, &admin, 300_000_000);
+    approve_reward_pool(&env, &xlm_token, &admin, &client.address, 200_000_000);
+
+    let season1_id = client.create_season(&admin, &100, &200, &100_000_000);
+    assert_eq!(season1_id, 1);
+
+    // S2 starts exactly where S1 ends — must succeed.
+    let season2_id = client.create_season(&admin, &200, &300, &100_000_000);
+    assert_eq!(season2_id, 2);
+}
+
+#[test]
+fn test_season_overlap_starts_inside_fails() {
+    // S1=[100,200], S2=[150,300]: S2 starts inside S1 and extends beyond it → reject.
+    let env = Env::default();
+    let (client, xlm_token, admin, _oracle) = deploy(&env);
+
+    fund(&env, &xlm_token, &admin, 300_000_000);
+    approve_reward_pool(&env, &xlm_token, &admin, &client.address, 200_000_000);
+
+    client.create_season(&admin, &100, &200, &100_000_000);
+
+    let result = client.try_create_season(&admin, &150, &300, &100_000_000);
+    assert_eq!(result, Err(Ok(InsightArenaError::SeasonOverlap)));
+}
+
+#[test]
+fn test_season_overlap_fully_contains_existing_fails() {
+    // S1=[100,200], S2=[50,300]: S2 fully wraps around S1 → reject.
+    let env = Env::default();
+    let (client, xlm_token, admin, _oracle) = deploy(&env);
+
+    fund(&env, &xlm_token, &admin, 300_000_000);
+    approve_reward_pool(&env, &xlm_token, &admin, &client.address, 200_000_000);
+
+    client.create_season(&admin, &100, &200, &100_000_000);
+
+    let result = client.try_create_season(&admin, &50, &300, &100_000_000);
+    assert_eq!(result, Err(Ok(InsightArenaError::SeasonOverlap)));
 }
 
 // ── calculate_points arithmetic edge cases (#1266) ────────────────────────────
@@ -962,5 +1027,73 @@ fn test_finalize_season_non_admin_rejected() {
         Err(Ok(InsightArenaError::Unauthorized)),
         "non-admin must not finalize a season"
     );
+}
+
+// ── Emergency pause coverage ──────────────────────────────────────────────────
+
+#[test]
+fn test_create_season_fails_when_paused() {
+    let env = Env::default();
+    let (client, xlm_token, admin, _oracle) = deploy(&env);
+
+    fund(&env, &xlm_token, &admin, 100_000_000);
+    approve_reward_pool(&env, &xlm_token, &admin, &client.address, 50_000_000);
+
+    client.set_paused(&true, &1u32);
+
+    let result = client.try_create_season(&admin, &100, &200, &50_000_000);
+    assert_eq!(result, Err(Ok(InsightArenaError::Paused)));
+}
+
+#[test]
+fn test_update_leaderboard_fails_when_paused() {
+    let env = Env::default();
+    let (client, xlm_token, admin, _oracle) = deploy(&env);
+
+    fund(&env, &xlm_token, &admin, 200_000_000);
+    approve_reward_pool(&env, &xlm_token, &admin, &client.address, 100_000_000);
+
+    let season_id = client.create_season(&admin, &10, &100, &100_000_000);
+
+    client.set_paused(&true, &1u32);
+
+    let result = client.try_update_leaderboard(&admin, &season_id, &sample_entries(&env));
+    assert_eq!(result, Err(Ok(InsightArenaError::Paused)));
+}
+
+#[test]
+fn test_finalize_season_fails_when_paused() {
+    let env = Env::default();
+    let (client, xlm_token, admin, _oracle) = deploy(&env);
+
+    fund(&env, &xlm_token, &admin, 200_000_000);
+    approve_reward_pool(&env, &xlm_token, &admin, &client.address, 100_000_000);
+
+    let season_id = client.create_season(&admin, &10, &100, &100_000_000);
+    client.update_leaderboard(&admin, &season_id, &sample_entries(&env));
+    env.ledger().set_timestamp(100);
+
+    client.set_paused(&true, &1u32);
+
+    let result = client.try_finalize_season(&admin, &season_id);
+    assert_eq!(result, Err(Ok(InsightArenaError::Paused)));
+}
+
+#[test]
+fn test_reset_season_points_fails_when_paused() {
+    let env = Env::default();
+    let (client, xlm_token, admin, _oracle) = deploy(&env);
+
+    fund(&env, &xlm_token, &admin, 200_000_000);
+    approve_reward_pool(&env, &xlm_token, &admin, &client.address, 100_000_000);
+
+    let season1_id = client.create_season(&admin, &0, &100, &50_000_000);
+    let season2_id = client.create_season(&admin, &200, &300, &50_000_000);
+    let _ = season1_id;
+
+    client.set_paused(&true, &1u32);
+
+    let result = client.try_reset_season_points(&admin, &season2_id);
+    assert_eq!(result, Err(Ok(InsightArenaError::Paused)));
 }
 

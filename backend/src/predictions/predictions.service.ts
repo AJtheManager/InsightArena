@@ -1,14 +1,8 @@
-import {
-  Injectable,
-  ConflictException,
-  BadRequestException,
-  ForbiddenException,
-  NotFoundException,
-  Logger,
-} from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { ConfigService } from '@nestjs/config';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, In } from 'typeorm';
+import { Readable } from 'stream';
 import { Prediction } from './entities/prediction.entity';
 import {
   FraudFlagStatus,
@@ -18,7 +12,21 @@ import {
 import { ListFraudFlagsQueryDto } from './dto/list-fraud-flags-query.dto';
 import { SubmitPredictionDto } from './dto/submit-prediction.dto';
 import { SubmitPredictionResponseDto } from './dto/submit-prediction-response.dto';
-import { UpdatePredictionNoteDto } from './dto/update-prediction-note.dto';
+import {
+  BatchPredictionItemDto,
+  MAX_BATCH_PREDICTIONS,
+  SubmitBatchPredictionsDto,
+} from './dto/submit-batch-prediction.dto';
+import {
+  BATCH_PREDICTION_STATUS,
+  BatchPredictionResultDto,
+  BatchSubmitResponseDto,
+} from './dto/batch-submit-response.dto';
+import {
+  PREDICTION_NOTE_MAX_LENGTH,
+  UpdatePredictionNoteDto,
+} from './dto/update-prediction-note.dto';
+import { sanitizePlainText } from '../common/text-sanitizer.util';
 import {
   ListMarketPredictionsDto,
   MarketPredictionResponseDto,
@@ -30,6 +38,8 @@ import {
   PredictionWithStatus,
   PaginatedMyPredictionsResponse,
 } from './dto/list-my-predictions.dto';
+import { PnlQueryDto, PnlResponseDto } from './dto/pnl-query.dto';
+import { ExportPredictionsDto } from './dto/export-predictions.dto';
 import { User } from '../users/entities/user.entity';
 import { UsersService } from '../users/users.service';
 import { Market } from '../markets/entities/market.entity';
@@ -37,12 +47,39 @@ import { SorobanService } from '../soroban/soroban.service';
 import { SlippageCheckerService } from './services/slippage-checker.service';
 import {
   ClaimAllRewardsResponseDto,
+  ClaimResultDto,
   RewardsSummaryDto,
 } from './dto/rewards-summary.dto';
+import {
+  MarketNotFoundException,
+  MarketClosedException,
+  InvalidOutcomeException,
+  DuplicatePredictionException,
+  PredictionNotFoundException,
+  UnauthorizedPredictionAccessException,
+  PayoutAlreadyClaimedException,
+  MarketNotResolvedException,
+  PredictionNotWonException,
+  NoClaimableRewardsException,
+  BatchSizeExceededException,
+  BatchValidationFailedException,
+  BatchChainSubmissionFailedException,
+  NoteTooLongException,
+} from './exceptions';
 
 const STROOPS_PER_XLM = 10_000_000n;
 
 function stroopsToXlm(stroops: bigint): number {
+  return Number(stroops) / Number(STROOPS_PER_XLM);
+}
+
+/**
+ * Same conversion but accepts negative bigint values, preserving the sign.
+ */
+function signedStroopsToXlm(stroops: bigint): number {
+  if (stroops < 0n) {
+    return -(Number(-stroops) / Number(STROOPS_PER_XLM));
+  }
   return Number(stroops) / Number(STROOPS_PER_XLM);
 }
 
@@ -64,7 +101,7 @@ export class PredictionsService {
     private readonly dataSource: DataSource,
     private readonly configService: ConfigService,
     private readonly usersService: UsersService,
-  ) { }
+  ) {}
 
   /**
    * Submit a prediction for a market with optional slippage protection.
@@ -81,7 +118,7 @@ export class PredictionsService {
     });
 
     if (!market) {
-      throw new NotFoundException(`Market "${dto.market_id}" not found`);
+      throw new MarketNotFoundException(dto.market_id);
     }
 
     if (
@@ -90,7 +127,7 @@ export class PredictionsService {
       market.is_paused ||
       new Date() > market.end_time
     ) {
-      throw new BadRequestException(
+      throw new MarketClosedException(
         market.is_paused
           ? 'Market is paused - predictions are no longer accepted'
           : 'Market is closed - predictions are no longer accepted',
@@ -98,18 +135,35 @@ export class PredictionsService {
     }
 
     if (!market.outcome_options.includes(dto.chosen_outcome)) {
-      throw new BadRequestException(
-        `Invalid outcome "${dto.chosen_outcome}". Valid options: ${market.outcome_options.join(', ')}`,
+      throw new InvalidOutcomeException(
+        dto.chosen_outcome,
+        market.outcome_options,
       );
     }
 
+    // Check for existing prediction with the same clientIdempotencyKey
+    // If found, return it to support safe retries
+    const existingByKey = await this.predictionsRepository.findOne({
+      where: { clientIdempotencyKey: dto.clientIdempotencyKey },
+      relations: ['market'],
+    });
+    if (existingByKey) {
+      this.logger.log(
+        `Idempotent key reuse detected for user ${user.id}; returning existing prediction ${existingByKey.id}`,
+      );
+      return {
+        prediction: existingByKey,
+        realized_price: '0',
+        shares_received: '0',
+      };
+    }
+
+    // Check for duplicate prediction on the same market (market uniqueness constraint)
     const existing = await this.predictionsRepository.findOne({
       where: { user: { id: user.id }, market: { id: market.id } },
     });
     if (existing) {
-      throw new ConflictException(
-        'You have already submitted a prediction for this market',
-      );
+      throw new DuplicatePredictionException(market.id);
     }
 
     const { tx_hash, realized_price, shares_received } =
@@ -140,6 +194,7 @@ export class PredictionsService {
         market,
         chosen_outcome: dto.chosen_outcome,
         stake_amount_stroops: dto.stake_amount_stroops,
+        clientIdempotencyKey: dto.clientIdempotencyKey,
         tx_hash,
         payout_claimed: false,
         payout_amount_stroops: '0',
@@ -154,9 +209,9 @@ export class PredictionsService {
           participant_count: () => 'participant_count + 1',
           ...(BigInt(dto.stake_amount_stroops) !== 0n
             ? {
-              total_pool_stroops: () =>
-                'CAST(total_pool_stroops AS BIGINT) + :stakeAmount',
-            }
+                total_pool_stroops: () =>
+                  'CAST(total_pool_stroops AS BIGINT) + :stakeAmount',
+              }
             : {}),
         })
         .where('id = :id', { id: market.id })
@@ -173,9 +228,9 @@ export class PredictionsService {
           total_predictions: () => 'total_predictions + 1',
           ...(BigInt(dto.stake_amount_stroops) !== 0n
             ? {
-              total_staked_stroops: () =>
-                'CAST(total_staked_stroops AS BIGINT) + :stakeAmount',
-            }
+                total_staked_stroops: () =>
+                  'CAST(total_staked_stroops AS BIGINT) + :stakeAmount',
+              }
             : {}),
         })
         .where('id = :id', { id: user.id })
@@ -215,6 +270,313 @@ export class PredictionsService {
       realized_price: realized_price || '0',
       shares_received: shares_received || '0',
     };
+  }
+
+  /**
+   * Submit a batch (slip) of predictions in a single call.
+   *
+   * Validation is performed up-front for every item. In atomic mode
+   * (default) any validation or on-chain failure rejects the whole slip
+   * before anything is persisted; in non-atomic mode valid items are still
+   * submitted and failures are reported per item in the response.
+   */
+  async submitBatch(
+    dto: SubmitBatchPredictionsDto,
+    user: User,
+  ): Promise<BatchSubmitResponseDto> {
+    const atomic = dto.atomic ?? true;
+    const items = dto.predictions;
+
+    if (items.length > MAX_BATCH_PREDICTIONS) {
+      throw new BatchSizeExceededException(items.length, MAX_BATCH_PREDICTIONS);
+    }
+
+    // Bulk-load every referenced market exactly once.
+    const marketIds = [...new Set(items.map((item) => item.market_id))];
+    const markets =
+      marketIds.length > 0
+        ? await this.marketsRepository.find({ where: { id: In(marketIds) } })
+        : [];
+    const marketById = new Map(markets.map((market) => [market.id, market]));
+
+    // Markets this user has already predicted on (duplicate guard).
+    const existingPredictions =
+      marketIds.length > 0
+        ? await this.predictionsRepository.find({
+            where: {
+              user: { id: user.id },
+              market: { id: In(marketIds) },
+            },
+          })
+        : [];
+    const predictedMarketIds = new Set(
+      existingPredictions.map((prediction) => prediction.market.id),
+    );
+
+    // Check for existing predictions with the same clientIdempotencyKeys
+    const idempotencyKeys = items.map((item) => item.clientIdempotencyKey);
+    const existingByKey =
+      idempotencyKeys.length > 0
+        ? await this.predictionsRepository.find({
+            where: {
+              clientIdempotencyKey: In(idempotencyKeys),
+            },
+          })
+        : [];
+    const existingKeySet = new Set(
+      existingByKey.map((p) => p.clientIdempotencyKey),
+    );
+
+    // Validate every item before touching the chain.
+    const seenInBatch = new Set<string>();
+    const seenIdempotencyKeys = new Set<string>();
+    const failures = new Map<number, string>();
+    items.forEach((item, index) => {
+      const failure = this.getBatchItemFailure(
+        item,
+        marketById.get(item.market_id),
+        predictedMarketIds,
+        seenInBatch,
+        seenIdempotencyKeys,
+        existingKeySet,
+      );
+      if (failure) {
+        failures.set(index, failure);
+      }
+    });
+
+    if (atomic && failures.size > 0) {
+      throw new BatchValidationFailedException(
+        [...failures].map(([index, error]) => ({ index, error })),
+      );
+    }
+
+    // On-chain submissions + slippage checks for actionable items only.
+    const chainResults = new Map<
+      number,
+      { tx_hash: string; realized_price: string; shares_received: string }
+    >();
+
+    for (let index = 0; index < items.length; index++) {
+      if (failures.has(index)) continue;
+
+      const item = items[index];
+      const market = marketById.get(item.market_id) as Market;
+
+      try {
+        const result = await this.sorobanService.submitPrediction(
+          user.stellar_address,
+          market.on_chain_market_id,
+          item.chosen_outcome,
+          item.stake_amount_stroops,
+        );
+
+        if (
+          (item.maxPrice || item.minSharesOut) &&
+          result.realized_price &&
+          result.shares_received
+        ) {
+          this.slippageCheckerService.checkSlippage(
+            item.maxPrice,
+            item.minSharesOut,
+            result.realized_price,
+            result.shares_received,
+          );
+        }
+
+        chainResults.set(index, {
+          tx_hash: result.tx_hash,
+          realized_price: result.realized_price || '0',
+          shares_received: result.shares_received || '0',
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failures.set(index, `On-chain submission failed: ${message}`);
+
+        if (atomic) {
+          throw new BatchChainSubmissionFailedException(
+            [...failures].map(([i, error]) => ({ index: i, error })),
+          );
+        }
+      }
+    }
+
+    // Persist every successful item inside a single database transaction.
+    const persistedByIndex = await this.dataSource.transaction(
+      async (
+        manager,
+      ): Promise<Map<number, { prediction: Prediction; tx_hash: string }>> => {
+        const savedByIndex = new Map<
+          number,
+          { prediction: Prediction; tx_hash: string }
+        >();
+        let totalStake = 0n;
+
+        for (const [index, result] of chainResults) {
+          const item = items[index];
+          const market = marketById.get(item.market_id) as Market;
+          totalStake += BigInt(item.stake_amount_stroops);
+
+          const pred = manager.create(Prediction, {
+            user,
+            market,
+            chosen_outcome: item.chosen_outcome,
+            stake_amount_stroops: item.stake_amount_stroops,
+            clientIdempotencyKey: item.clientIdempotencyKey,
+            tx_hash: result.tx_hash,
+            payout_claimed: false,
+            payout_amount_stroops: '0',
+          });
+
+          const saved = await manager.save(pred);
+          savedByIndex.set(index, {
+            prediction: saved,
+            tx_hash: result.tx_hash,
+          });
+
+          await manager
+            .createQueryBuilder()
+            .update(Market)
+            .set({
+              participant_count: () => 'participant_count + 1',
+              ...(BigInt(item.stake_amount_stroops) !== 0n
+                ? {
+                    total_pool_stroops: () =>
+                      'CAST(total_pool_stroops AS BIGINT) + :stakeAmount',
+                  }
+                : {}),
+            })
+            .where('id = :id', { id: market.id })
+            .setParameter(
+              'stakeAmount',
+              BigInt(item.stake_amount_stroops).toString(),
+            )
+            .execute();
+
+          this.logger.log(
+            `Batch item ${index}: prediction ${saved.id} saved for user ${user.id} on market ${market.id}`,
+          );
+        }
+
+        // Aggregate user counters once per slip.
+        if (chainResults.size > 0) {
+          await manager
+            .createQueryBuilder()
+            .update(User)
+            .set({
+              total_predictions: () =>
+                `total_predictions + ${chainResults.size}`,
+              ...(totalStake !== 0n
+                ? {
+                    total_staked_stroops: () =>
+                      'CAST(total_staked_stroops AS BIGINT) + :totalStake',
+                  }
+                : {}),
+            })
+            .where('id = :id', { id: user.id })
+            .setParameter('totalStake', totalStake.toString())
+            .execute();
+        }
+
+        return savedByIndex;
+      },
+    );
+
+    // Post-persist hooks are advisory-only and non-blocking.
+    this.evaluateFraudSignalsForUser(user.id).catch((err) => {
+      this.logger.error(
+        `Fraud signal evaluation failed for user ${user.id}`,
+        err,
+      );
+    });
+    this.usersService.recordQualifyingAction(user.id).catch((err) => {
+      this.logger.error(
+        `Referral qualifying-action tracking failed for user ${user.id}`,
+        err,
+      );
+    });
+
+    const results: BatchPredictionResultDto[] = items.map((item, index) => {
+      const saved = persistedByIndex.get(index);
+
+      if (!saved) {
+        return {
+          index,
+          market_id: item.market_id,
+          status: BATCH_PREDICTION_STATUS.REJECTED,
+          error: failures.get(index),
+        };
+      }
+
+      return {
+        index,
+        market_id: item.market_id,
+        status: BATCH_PREDICTION_STATUS.FULFILLED,
+        prediction: saved.prediction,
+        realized_price: chainResults.get(index)?.realized_price || '0',
+        shares_received: chainResults.get(index)?.shares_received || '0',
+      };
+    });
+
+    return {
+      results,
+      succeeded: results.filter(
+        (r) => r.status === BATCH_PREDICTION_STATUS.FULFILLED,
+      ).length,
+      failed: results.filter(
+        (r) => r.status === BATCH_PREDICTION_STATUS.REJECTED,
+      ).length,
+      atomic,
+    };
+  }
+
+  private getBatchItemFailure(
+    item: BatchPredictionItemDto,
+    market: Market | undefined,
+    predictedMarketIds: Set<string>,
+    seenInBatch: Set<string>,
+    seenIdempotencyKeys: Set<string>,
+    existingKeySet: Set<string>,
+  ): string | null {
+    if (!market) {
+      return `Market "${item.market_id}" not found`;
+    }
+
+    if (market.is_paused) {
+      return 'Market is paused - predictions are no longer accepted';
+    }
+
+    if (
+      market.is_resolved ||
+      market.is_cancelled ||
+      new Date() > market.end_time
+    ) {
+      return 'Market is closed - predictions are no longer accepted';
+    }
+
+    if (!market.outcome_options.includes(item.chosen_outcome)) {
+      return `Invalid outcome "${item.chosen_outcome}". Valid options: ${market.outcome_options.join(', ')}`;
+    }
+
+    if (predictedMarketIds.has(market.id)) {
+      return 'You have already submitted a prediction for this market';
+    }
+
+    if (seenInBatch.has(market.id)) {
+      return 'Duplicate prediction for this market within the batch';
+    }
+    seenInBatch.add(market.id);
+
+    // Check for duplicate or existing idempotency keys
+    if (seenIdempotencyKeys.has(item.clientIdempotencyKey)) {
+      return 'Duplicate clientIdempotencyKey within this batch';
+    }
+    if (existingKeySet.has(item.clientIdempotencyKey)) {
+      return 'clientIdempotencyKey already used in a previous prediction';
+    }
+    seenIdempotencyKeys.add(item.clientIdempotencyKey);
+
+    return null;
   }
 
   /**
@@ -290,14 +652,12 @@ export class PredictionsService {
     });
 
     if (!prediction) {
-      throw new NotFoundException(`Prediction "${id}" not found`);
+      throw new PredictionNotFoundException(id);
     }
 
     // Check authorization: only owner can view
     if (prediction.user.id !== userId) {
-      throw new ForbiddenException(
-        'You do not have permission to view this prediction',
-      );
+      throw new UnauthorizedPredictionAccessException(id);
     }
 
     return this.enrichWithStatus(prediction);
@@ -343,6 +703,15 @@ export class PredictionsService {
   /**
    * Update the personal note on a prediction.
    * Only the prediction owner can update their note.
+   *
+   * The note is sanitized (HTML tags and control characters stripped) before
+   * the length check and persistence, so a payload that only exceeds the
+   * limit once markup is counted isn't rejected, and so stored-XSS via
+   * unsanitized markup is never written to the database. This is
+   * defense-in-depth alongside the DTO's own `@Transform`/`@MaxLength`,
+   * since this method is also called directly in tests and could be called
+   * from other server-side call sites that bypass the HTTP validation
+   * pipeline entirely.
    */
   async updateNote(
     predictionId: string,
@@ -355,10 +724,18 @@ export class PredictionsService {
     });
 
     if (!prediction) {
-      throw new NotFoundException(`Prediction "${predictionId}" not found`);
+      throw new PredictionNotFoundException(predictionId);
     }
 
-    prediction.note = dto.note;
+    const sanitizedNote = sanitizePlainText(dto.note);
+    if (sanitizedNote.length > PREDICTION_NOTE_MAX_LENGTH) {
+      throw new NoteTooLongException(
+        sanitizedNote.length,
+        PREDICTION_NOTE_MAX_LENGTH,
+      );
+    }
+
+    prediction.note = sanitizedNote;
     return this.predictionsRepository.save(prediction);
   }
 
@@ -373,20 +750,20 @@ export class PredictionsService {
     });
 
     if (!prediction) {
-      throw new NotFoundException(`Prediction "${predictionId}" not found`);
+      throw new PredictionNotFoundException(predictionId);
     }
 
     if (prediction.payout_claimed) {
-      throw new ConflictException('Payout has already been claimed');
+      throw new PayoutAlreadyClaimedException(predictionId);
     }
 
     const market = prediction.market;
     if (!market.is_resolved) {
-      throw new BadRequestException('Market is not yet resolved');
+      throw new MarketNotResolvedException(market.id);
     }
 
     if (market.resolved_outcome !== prediction.chosen_outcome) {
-      throw new BadRequestException('You did not win this prediction');
+      throw new PredictionNotWonException(predictionId);
     }
 
     const { tx_hash, payout_amount_stroops } =
@@ -445,6 +822,10 @@ export class PredictionsService {
   /**
    * Claim every currently-claimable prediction for a user in sequence, reusing
    * `claim()` for the actual on-chain submission and bookkeeping per prediction.
+   *
+   * Each claim is isolated: a failure on one prediction (e.g. a transient
+   * on-chain error) is recorded in that entry's `results` and does not stop
+   * the remaining claimable predictions from being attempted.
    */
   async claimAllRewards(user: User): Promise<ClaimAllRewardsResponseDto> {
     const predictions = await this.predictionsRepository.find({
@@ -461,23 +842,46 @@ export class PredictionsService {
       .map((p) => p.id);
 
     if (claimableIds.length === 0) {
-      throw new BadRequestException('No claimable rewards');
+      throw new NoClaimableRewardsException(user.id);
     }
 
     let claimedStroops = 0n;
     let lastTxHash = '';
+    const results: ClaimResultDto[] = [];
+
     for (const predictionId of claimableIds) {
-      const claimed = await this.claim(predictionId, user);
-      claimedStroops += BigInt(claimed.payout_amount_stroops ?? '0');
-      lastTxHash = claimed.tx_hash ?? lastTxHash;
+      try {
+        const claimed = await this.claim(predictionId, user);
+        claimedStroops += BigInt(claimed.payout_amount_stroops ?? '0');
+        lastTxHash = claimed.tx_hash ?? lastTxHash;
+        results.push({
+          prediction_id: predictionId,
+          status: BATCH_PREDICTION_STATUS.FULFILLED,
+          tx_hash: claimed.tx_hash ?? undefined,
+          payout_amount_stroops: claimed.payout_amount_stroops ?? undefined,
+        });
+      } catch (err) {
+        this.logger.error(
+          `claimAllRewards: claim failed for prediction ${predictionId}`,
+          err,
+        );
+        results.push({
+          prediction_id: predictionId,
+          status: BATCH_PREDICTION_STATUS.REJECTED,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     const summary = await this.getRewardsSummary(user);
 
     return {
       claimed_xlm: stroopsToXlm(claimedStroops),
-      claimed_count: claimableIds.length,
+      claimed_count: results.filter(
+        (r) => r.status === BATCH_PREDICTION_STATUS.FULFILLED,
+      ).length,
       transaction_hash: lastTxHash,
+      results,
       summary,
     };
   }
@@ -524,6 +928,82 @@ export class PredictionsService {
     }));
 
     return { data, total, page, limit };
+  }
+
+  /**
+   * Stream the user's predictions as a CSV without loading all rows into memory.
+   * Returns a Readable stream that pipes CSV rows as they are fetched.
+   */
+  exportCsv(user: User, dto: ExportPredictionsDto): Readable {
+    const qb = this.predictionsRepository
+      .createQueryBuilder('prediction')
+      .leftJoinAndSelect('prediction.market', 'market')
+      .where('prediction.userId = :userId', { userId: user.id })
+      .orderBy('prediction.submitted_at', 'DESC')
+      .select([
+        'prediction.id',
+        'prediction.chosen_outcome',
+        'prediction.stake_amount_stroops',
+        'prediction.payout_claimed',
+        'prediction.payout_amount_stroops',
+        'prediction.submitted_at',
+        'prediction.note',
+        'market.title',
+        'market.resolved_outcome',
+        'market.is_resolved',
+        'market.is_cancelled',
+      ]);
+
+    if (dto.start_date) {
+      qb.andWhere('prediction.submitted_at >= :startDate', {
+        startDate: new Date(dto.start_date),
+      });
+    }
+    if (dto.end_date) {
+      qb.andWhere('prediction.submitted_at <= :endDate', {
+        endDate: new Date(dto.end_date),
+      });
+    }
+
+    const readable = new Readable({ read() {} });
+
+    // Start streaming asynchronously
+    (async () => {
+      try {
+        readable.push(
+          'id,market_title,chosen_outcome,stake_stroops,status,payout_stroops,note,submitted_at\n',
+        );
+
+        const stream = await qb.stream();
+
+        for await (const prediction of stream) {
+          const market = prediction.market ?? {};
+          const status = computeExportStatus(prediction, market);
+          const note = (prediction.note ?? '').replace(/"/g, '""');
+          const title = (market.title ?? '').replace(/"/g, '""');
+          const row = [
+            prediction.id,
+            `"${title}"`,
+            `"${prediction.chosen_outcome}"`,
+            prediction.stake_amount_stroops,
+            status,
+            prediction.payout_amount_stroops ?? '0',
+            `"${note}"`,
+            prediction.submitted_at instanceof Date
+              ? prediction.submitted_at.toISOString()
+              : String(prediction.submitted_at),
+          ].join(',');
+
+          readable.push(row + '\n');
+        }
+
+        readable.push(null);
+      } catch (err) {
+        readable.destroy(err instanceof Error ? err : new Error(String(err)));
+      }
+    })();
+
+    return readable;
   }
 
   /**
@@ -576,10 +1056,7 @@ export class PredictionsService {
       'FRAUD_TIMING_CLUSTER_WINDOW_SECONDS',
       30,
     );
-    const minRatio = this.getFloatConfig(
-      'FRAUD_TIMING_CLUSTER_MIN_RATIO',
-      0.6,
-    );
+    const minRatio = this.getFloatConfig('FRAUD_TIMING_CLUSTER_MIN_RATIO', 0.6);
 
     const predictions = await this.predictionsRepository.find({
       where: { user: { id: userId } },
@@ -630,10 +1107,7 @@ export class PredictionsService {
   private async computeCounterpartyConcentrationSignal(
     userId: string,
   ): Promise<FraudSignalResult | null> {
-    const minMarkets = this.getIntConfig(
-      'FRAUD_COUNTERPARTY_MIN_MARKETS',
-      5,
-    );
+    const minMarkets = this.getIntConfig('FRAUD_COUNTERPARTY_MIN_MARKETS', 5);
     const hhiThreshold = this.getFloatConfig(
       'FRAUD_COUNTERPARTY_HHI_THRESHOLD',
       0.5,
@@ -744,6 +1218,182 @@ export class PredictionsService {
     return saved;
   }
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // P&L Calculation
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Compute realized and unrealized P&L for a user.
+   *
+   * Realized P&L  — settled (resolved or cancelled) markets only.
+   *   Won:      payout_amount_stroops - stake_amount_stroops
+   *   Lost:     0 - stake_amount_stroops  (stake is gone)
+   *   Cancelled: 0 (stake returned by protocol; treated as break-even here)
+   *
+   * Unrealized P&L — open (unresolved, uncancelled) markets.
+   *   Implied fair value = stake × (total_pool / stake_for_chosen_outcome)
+   *   Unrealized P&L    = implied_value - stake
+   *
+   *   When stake_for_chosen_outcome is 0 (shouldn't happen but guard it),
+   *   we fall back to 0 unrealized value.
+   *
+   * The optional time filter applies to `prediction.submitted_at` so users
+   * can scope the report to a specific window.
+   *
+   * When `breakdown=true` the response also includes a per-market array whose
+   * values sum exactly to the aggregate totals (verified by the caller and
+   * by our unit tests).
+   */
+  async getPnl(user: User, dto: PnlQueryDto): Promise<PnlResponseDto> {
+    const qb = this.predictionsRepository
+      .createQueryBuilder('prediction')
+      .leftJoinAndSelect('prediction.market', 'market')
+      .where('prediction.userId = :userId', { userId: user.id });
+
+    if (dto.from) {
+      qb.andWhere('prediction.submitted_at >= :from', {
+        from: new Date(dto.from),
+      });
+    }
+    if (dto.to) {
+      qb.andWhere('prediction.submitted_at <= :to', {
+        to: new Date(dto.to),
+      });
+    }
+
+    const predictions = await qb.getMany();
+
+    // We need per-outcome stake totals for every open market the user is in,
+    // so we can compute implied odds. Fetch all predictions for those markets
+    // (not just the user's) in a single query.
+    const openMarketIds = [
+      ...new Set(
+        predictions
+          .filter((p) => !p.market.is_resolved && !p.market.is_cancelled)
+          .map((p) => p.market.id),
+      ),
+    ];
+
+    // Map: marketId -> outcome -> total staked (stroops as bigint)
+    const marketOutcomeStake = new Map<string, Map<string, bigint>>();
+
+    if (openMarketIds.length > 0) {
+      const rows: Array<{ marketId: string; outcome: string; total: string }> =
+        await this.predictionsRepository
+          .createQueryBuilder('p')
+          .select('p.marketId', 'marketId')
+          .addSelect('p.chosen_outcome', 'outcome')
+          .addSelect('SUM(CAST(p.stake_amount_stroops AS BIGINT))', 'total')
+          .where('p.marketId IN (:...openMarketIds)', { openMarketIds })
+          .groupBy('p.marketId, p.chosen_outcome')
+          .getRawMany();
+
+      for (const row of rows) {
+        if (!marketOutcomeStake.has(row.marketId)) {
+          marketOutcomeStake.set(row.marketId, new Map());
+        }
+        marketOutcomeStake
+          .get(row.marketId)!
+          .set(row.outcome, BigInt(row.total));
+      }
+    }
+
+    // Aggregate
+    let totalRealizedStroops = 0n;
+    let totalUnrealizedStroops = 0n;
+    let totalStakedStroops = 0n;
+
+    const perMarketMap = new Map<
+      string,
+      {
+        market_id: string;
+        market_title: string;
+        realizedStroops: bigint;
+        unrealizedStroops: bigint;
+        stakedStroops: bigint;
+      }
+    >();
+
+    for (const prediction of predictions) {
+      const market = prediction.market;
+      const stake = BigInt(prediction.stake_amount_stroops);
+      totalStakedStroops += stake;
+
+      let realizedStroops = 0n;
+      let unrealizedStroops = 0n;
+
+      if (market.is_cancelled) {
+        // Protocol returns the stake; treat as break-even (0 P&L)
+        realizedStroops = 0n;
+      } else if (market.is_resolved) {
+        // Settled market
+        if (market.resolved_outcome === prediction.chosen_outcome) {
+          // Won: payout - stake
+          const payout = BigInt(prediction.payout_amount_stroops ?? '0');
+          realizedStroops = payout - stake;
+        } else {
+          // Lost: -stake
+          realizedStroops = -stake;
+        }
+      } else {
+        // Open position — compute implied value from pool-weighted odds
+        const outcomeStake = marketOutcomeStake.get(market.id);
+        const chosenOutcomeStake =
+          outcomeStake?.get(prediction.chosen_outcome) ?? 0n;
+        const totalPool = BigInt(market.total_pool_stroops ?? '0');
+
+        if (chosenOutcomeStake > 0n && totalPool > 0n) {
+          // implied_value = stake * (total_pool / chosen_outcome_pool)
+          // Using integer arithmetic with a precision multiplier to avoid
+          // floating-point loss before the final XLM conversion.
+          const PRECISION = 1_000_000n;
+          const impliedValueStroops =
+            (stake * totalPool * PRECISION) / chosenOutcomeStake / PRECISION;
+          unrealizedStroops = impliedValueStroops - stake;
+        }
+        // else: can't compute odds; leave unrealized at 0
+      }
+
+      totalRealizedStroops += realizedStroops;
+      totalUnrealizedStroops += unrealizedStroops;
+
+      if (dto.breakdown) {
+        const existing = perMarketMap.get(market.id);
+        if (existing) {
+          existing.realizedStroops += realizedStroops;
+          existing.unrealizedStroops += unrealizedStroops;
+          existing.stakedStroops += stake;
+        } else {
+          perMarketMap.set(market.id, {
+            market_id: market.id,
+            market_title: market.title,
+            realizedStroops,
+            unrealizedStroops,
+            stakedStroops: stake,
+          });
+        }
+      }
+    }
+
+    const result: PnlResponseDto = {
+      realized_pnl_xlm: signedStroopsToXlm(totalRealizedStroops),
+      unrealized_pnl_xlm: signedStroopsToXlm(totalUnrealizedStroops),
+      total_staked_xlm: stroopsToXlm(totalStakedStroops),
+    };
+
+    if (dto.breakdown) {
+      result.per_market = [...perMarketMap.values()].map((entry) => ({
+        market_id: entry.market_id,
+        market_title: entry.market_title,
+        realized_pnl_xlm: signedStroopsToXlm(entry.realizedStroops),
+        unrealized_pnl_xlm: signedStroopsToXlm(entry.unrealizedStroops),
+        staked_xlm: stroopsToXlm(entry.stakedStroops),
+      }));
+    }
+
+    return result;
+  }
+
   private getIntConfig(key: string, fallback: number): number {
     const raw = this.configService.get<string>(key);
     const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
@@ -807,4 +1457,18 @@ interface FraudSignalResult {
   score: number;
   threshold: number;
   details: Record<string, unknown>;
+}
+
+function computeExportStatus(
+  prediction: { chosen_outcome: string },
+  market: {
+    is_cancelled?: boolean;
+    is_resolved?: boolean;
+    resolved_outcome?: string | null;
+  },
+): string {
+  if (market.is_cancelled) return 'pending';
+  if (!market.is_resolved) return 'active';
+  if (market.resolved_outcome === prediction.chosen_outcome) return 'won';
+  return 'lost';
 }

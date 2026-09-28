@@ -8,6 +8,8 @@ use crate::storage_types::{
     UserProfile,
 };
 
+pub const MAX_OUTCOMES: u32 = 10;
+
 // ── Params struct ─────────────────────────────────────────────────────────────
 // Soroban limits contract functions to 10 parameters. Bundling the market
 // creation fields into a single `#[contracttype]` struct keeps the ABI legal
@@ -33,8 +35,42 @@ pub struct CreateMarketParams {
 
 // ── TTL helpers ───────────────────────────────────────────────────────────────
 
-fn bump_market(env: &Env, market_id: u64) {
-    config::extend_market_ttl(env, market_id);
+pub(crate) fn bump_market(env: &Env, market_id: u64) {
+    // Extend the whole hot-key set (market + escrow pool + price accumulator),
+    // not just the market record, so an active market's supporting state never
+    // gets archived before the market itself. See Issue #1516.
+    config::extend_active_market_ttl(env, market_id);
+}
+
+/// Permissionless maintenance call that keeps a live market's hot keys alive.
+///
+/// Anyone may invoke this — **no authorization is required** — so that market
+/// participants or off-chain keepers can extend the TTL on an active market's
+/// [`Market`] record, its escrow/liquidity pool, and its price accumulator,
+/// preventing them from being archived out from under stakers mid-lifecycle.
+///
+/// Resolved or cancelled markets are still bumped on request so their
+/// post-resolution claim and dispute windows remain reachable.
+///
+/// # Errors
+/// - `MarketNotFound` when no market exists for `market_id`.
+pub fn bump_market_ttl(env: &Env, market_id: u64) -> Result<(), InsightArenaError> {
+    // Confirm the market exists first: `extend_ttl` traps on a missing key, and
+    // we want a clean, catchable error instead of a contract panic.
+    if !env.storage().persistent().has(&DataKey::Market(market_id)) {
+        return Err(InsightArenaError::MarketNotFound);
+    }
+
+    config::extend_active_market_ttl(env, market_id);
+    emit_market_ttl_bumped(env, market_id);
+    Ok(())
+}
+
+fn emit_market_ttl_bumped(env: &Env, market_id: u64) {
+    env.events().publish(
+        (symbol_short!("market"), symbol_short!("ttl_bump")),
+        market_id,
+    );
 }
 
 fn bump_counter(env: &Env) {
@@ -259,16 +295,21 @@ pub fn create_market(
         return Err(InsightArenaError::InvalidTimeRange);
     }
 
-    // ── Guard 5: at least two outcomes required ───────────────────────────────
-    if params.outcomes.len() < 2 {
+    // ── Load config for reputation, fee, stake floor, and outcome bounds ──────
+    let cfg = config::get_config(env)?;
+
+    // ── Guard 5: 2 to N outcomes (max bounded) required ────────────────────────
+    let max_outcomes = if cfg.max_outcomes > 0 {
+        cfg.max_outcomes
+    } else {
+        MAX_OUTCOMES
+    };
+    if params.outcomes.len() < 2 || params.outcomes.len() > max_outcomes {
         return Err(InsightArenaError::InvalidInput);
     }
     if has_duplicate_outcomes(&params.outcomes) {
         return Err(InsightArenaError::InvalidInput);
     }
-
-    // ── Load config for reputation, fee, and stake floor checks ───────────────
-    let cfg = config::get_config(env)?;
 
     // ── Guard 6: creator reputation must meet the governance threshold ────────
     // Trusted-creator allowlist bypasses the score check entirely. The denial
@@ -325,6 +366,14 @@ pub fn create_market(
         .set(&DataKey::Market(market_id), &market);
     bump_market(env, market_id);
     append_market_to_category_index(env, &market.category, market_id);
+
+    // ── Collect anti-spam bond from the creator ───────────────────────────────
+    // Bond is collected via pre-approved allowance. If bond_amount == 0 in the
+    // current config this is a no-op. The market record is already persisted so
+    // the bond storage and the market storage are always in a consistent state
+    // (if the bond transfer fails, the whole transaction reverts, taking the
+    // market record with it).
+    crate::escrow::deposit_market_bond(env, &creator, market_id)?;
 
     // ── Emit MarketCreated event ──────────────────────────────────────────────
     emit_market_created(env, market_id, &creator, params.end_time, &metadata_hash);
@@ -757,6 +806,12 @@ pub fn cancel_market(env: &Env, caller: Address, market_id: u64) -> Result<(), I
         .set(&DataKey::Market(market_id), &market);
     bump_market(env, market_id);
 
+    // ── Forfeit the creator's anti-spam bond to the treasury ─────────────────
+    // On an invalid/spam cancellation the bond is never returned — it is
+    // credited to the protocol treasury as a deterrent. If no bond was
+    // deposited (bond was disabled at creation time) this is a no-op.
+    let _ = crate::escrow::forfeit_market_bond(env, market_id);
+
     // Deactivate all conditional children so no orphaned markets remain.
     // Each child market is also marked cancelled; its participants may call
     // claim_cancel_refund on the child market independently.
@@ -808,11 +863,18 @@ pub fn resolve_market(
 
     let mut market = get_market(&env, market_id)?;
 
-    if let Some(parent_market_id) = env
+    let parent_id_opt = env
         .storage()
         .persistent()
         .get::<_, u64>(&DataKey::ConditionalParent(market_id))
-    {
+        .or_else(|| {
+            env.storage()
+                .persistent()
+                .get::<_, ConditionalMarket>(&DataKey::ConditionalMarket(market_id))
+                .map(|cm| cm.parent_market_id)
+        });
+
+    if let Some(parent_market_id) = parent_id_opt {
         let parent_market = get_market(&env, parent_market_id)?;
         if !parent_market.is_resolved {
             return Err(InsightArenaError::ParentNotResolved);
@@ -852,6 +914,13 @@ pub fn resolve_market(
         config::PERSISTENT_THRESHOLD,
         config::PERSISTENT_BUMP,
     );
+
+    // ── Refund the creator's anti-spam bond on clean resolution ──────────────
+    // Normal resolution returns the bond to the creator — it was only there to
+    // deter spam, not to permanently penalise legitimate market creators.
+    // If no bond was deposited (bond was disabled at creation time) this is
+    // a no-op.
+    let _ = crate::escrow::refund_market_bond(&env, &market.creator, market_id);
 
     emit_market_resolved(&env, market_id, resolved_outcome.clone());
     reputation::on_market_resolved(&env, &market.creator, market.participant_count);
@@ -911,6 +980,9 @@ pub fn create_conditional_market(
     validate_conditional_params(env, parent_market_id, &required_outcome, &params)?;
 
     let parent_depth = calculate_conditional_depth(env, parent_market_id);
+    if parent_depth >= MAX_CONDITIONAL_DEPTH {
+        return Err(InsightArenaError::ConditionalDepthExceeded);
+    }
     let depth = parent_depth
         .checked_add(1)
         .ok_or(InsightArenaError::Overflow)?;
@@ -995,6 +1067,12 @@ pub fn get_parent_market(env: &Env, market_id: u64) -> Result<Market, InsightAre
         .storage()
         .persistent()
         .get(&DataKey::ConditionalParent(market_id))
+        .or_else(|| {
+            env.storage()
+                .persistent()
+                .get::<_, ConditionalMarket>(&DataKey::ConditionalMarket(market_id))
+                .map(|cm| cm.parent_market_id)
+        })
         .ok_or(InsightArenaError::MarketNotFound)?;
 
     get_market(env, parent_market_id)
@@ -1028,6 +1106,12 @@ pub fn get_conditional_chain(
         .storage()
         .persistent()
         .get::<_, u64>(&DataKey::ConditionalParent(cursor))
+        .or_else(|| {
+            env.storage()
+                .persistent()
+                .get::<_, ConditionalMarket>(&DataKey::ConditionalMarket(cursor))
+                .map(|cm| cm.parent_market_id)
+        })
     {
         chain_ids.push_back(parent_id);
         cursor = parent_id;
@@ -1055,6 +1139,12 @@ pub fn calculate_conditional_depth(env: &Env, market_id: u64) -> u32 {
         .storage()
         .persistent()
         .get::<_, u64>(&DataKey::ConditionalParent(cursor))
+        .or_else(|| {
+            env.storage()
+                .persistent()
+                .get::<_, ConditionalMarket>(&DataKey::ConditionalMarket(cursor))
+                .map(|cm| cm.parent_market_id)
+        })
     {
         depth = depth.saturating_add(1);
         cursor = parent_id;
@@ -1080,7 +1170,13 @@ pub fn get_dependency_status(
     let parent_market_id = env
         .storage()
         .persistent()
-        .get::<_, u64>(&DataKey::ConditionalParent(market_id));
+        .get::<_, u64>(&DataKey::ConditionalParent(market_id))
+        .or_else(|| {
+            env.storage()
+                .persistent()
+                .get::<_, ConditionalMarket>(&DataKey::ConditionalMarket(market_id))
+                .map(|cm| cm.parent_market_id)
+        });
 
     let (is_conditional, parent_resolved) = match parent_market_id {
         Some(parent_id) => {
@@ -1148,6 +1244,12 @@ fn validate_no_circular_dependency(
             .storage()
             .persistent()
             .get::<_, u64>(&DataKey::ConditionalParent(current))
+            .or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get::<_, ConditionalMarket>(&DataKey::ConditionalMarket(current))
+                    .map(|cm| cm.parent_market_id)
+            })
         {
             current = next_parent;
         } else {
@@ -1237,15 +1339,20 @@ pub fn add_volume(env: &Env, amount: i128) {
 }
 
 /// Accumulate per-outcome stake pools by iterating the predictor list.
+///
+/// Outcomes are discovered from the predictions themselves, so an outcome that
+/// received no stake is absent from the result — an unstaked market yields an
+/// empty distribution. This holds for any outcome count; N-way markets simply
+/// surface however many of their options have been staked.
 fn accumulate_outcome_pools(env: &Env, market_id: u64) -> (Vec<Symbol>, Vec<i128>) {
+    let mut outcome_symbols: Vec<Symbol> = Vec::new(env);
+    let mut outcome_pools: Vec<i128> = Vec::new(env);
+
     let predictors: Vec<Address> = env
         .storage()
         .persistent()
         .get(&DataKey::PredictorList(market_id))
         .unwrap_or_else(|| Vec::new(env));
-
-    let mut outcome_symbols: Vec<Symbol> = Vec::new(env);
-    let mut outcome_pools: Vec<i128> = Vec::new(env);
 
     for predictor in predictors.iter() {
         if let Some(pred) = env

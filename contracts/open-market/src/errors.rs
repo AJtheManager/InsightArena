@@ -42,6 +42,9 @@ pub enum InsightArenaError {
     MarketNotResolved = 12,
     /// The current ledger timestamp is past `end_time`.
     /// Raised when a prediction submission arrives after the market has closed.
+    /// REUSED for AMM swap deadline protection: also raised by
+    /// `liquidity::swap_outcome` when the caller-supplied `deadline` has
+    /// already passed (reserves may have moved since the trade was signed).
     MarketExpired = 13,
     /// The current ledger timestamp is before `start_time`.
     /// Raised when a prediction submission arrives before the market opens.
@@ -85,6 +88,9 @@ pub enum InsightArenaError {
     AlreadyPredicted = 21,
     /// The submitted stake is below the market's `min_stake` threshold.
     /// Raised during prediction submission to enforce the minimum entry amount.
+    /// REUSED for AMM swap slippage protection: also raised by
+    /// `liquidity::swap_outcome` when the computed `amount_out` falls below
+    /// the caller-supplied `min_amount_out` guard.
     StakeTooLow = 22,
     /// The submitted stake exceeds the market's `max_stake` ceiling.
     /// Raised during prediction submission to enforce the maximum entry amount.
@@ -100,11 +106,16 @@ pub enum InsightArenaError {
     RefundAlreadyClaimed = 26,
     /// The caller has no stake in this market and is therefore not entitled to a refund.
     /// Raised by `claim_cancel_refund` when the address never submitted a prediction.
+    /// REUSED for anti-spam bond: also raised when `deposit_market_bond` is called
+    /// for a market that already has a bond deposited (prevents double-deposit).
     NotAParticipant = 27,
 
     // ── Escrow ────────────────────────────────────────────────────────────────
     /// The contract's escrow balance is insufficient to complete the transfer.
     /// Raised when a payout or refund exceeds the available on-chain funds.
+    /// REUSED for anti-spam bond: also raised when `create_market` is called
+    /// with `bond_amount > 0` but the creator has not transferred the required
+    /// bond into escrow (i.e. allowance/balance is insufficient).
     InsufficientFunds = 30,
     /// A native XLM token transfer via the Stellar asset contract failed.
     /// Raised when the underlying `transfer` call returns an error.
@@ -153,6 +164,9 @@ pub enum InsightArenaError {
     Paused = 101,
     /// A supplied argument fails basic validation that is not covered by a more
     /// specific error code (e.g. empty strings, zero-length outcome lists).
+    /// REUSED by `governance::execute_proposal`: also raised when a proposal's
+    /// voting window closes with turnout below `Config::governance_quorum_bps`,
+    /// distinguishing a quorum failure from a majority failure (`Unauthorized`).
     InvalidInput = 102,
 
     // ── Conditional Markets ───────────────────────────────────────────────────
@@ -203,5 +217,13 @@ pub enum InsightArenaError {
     SelfTransfer = 111,
     /// `transfer_prediction` was called with `shares <= 0`.
     /// A transfer must move a strictly positive amount.
+    /// REUSED for early position withdrawals:
+    /// - Withdrawal attempted after market lock time (MarketExpired not applicable pre-lock)
+    /// - Withdrawal amount is zero or invalid
+    /// - Withdrawal amount exceeds user's current stake
+    /// REUSED for dispute resolution guards:
+    /// - A dispute has already been resolved and cannot be settled again
+    ///   (prevents double-refund or double-slash in resolve_dispute/finalize_arbiter_vote)
+    /// - Attempted to slash a bond that has already been slashed or refunded
     ZeroShareTransfer = 112,
 }

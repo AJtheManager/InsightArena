@@ -13,6 +13,7 @@ describe('ApiKeyController', () => {
       create: jest.fn(),
       listForUser: jest.fn(),
       revoke: jest.fn(),
+      rotate: jest.fn(),
     } as unknown as jest.Mocked<ApiKeyService>;
 
     const module: TestingModule = await Test.createTestingModule({
@@ -35,7 +36,10 @@ describe('ApiKeyController', () => {
   describe('create', () => {
     it('should create an API key with scopes', async () => {
       const mockUser = { id: 'user123' } as User;
-      const dto: CreateApiKeyDto = { name: 'Test Key', scopes: ['read', 'write'] };
+      const dto: CreateApiKeyDto = {
+        name: 'Test Key',
+        scopes: ['read', 'write'],
+      };
       const expectedResponse = {
         id: 'key1',
         name: 'Test Key',
@@ -52,6 +56,55 @@ describe('ApiKeyController', () => {
 
       expect(apiKeyService.create).toHaveBeenCalledWith(mockUser.id, dto);
       expect(result).toEqual(expectedResponse);
+    });
+  });
+
+  describe('rotate', () => {
+    it('should rotate a key and pass through the grace period override', async () => {
+      const mockUser = { id: 'user123' } as User;
+      const expectedResponse = {
+        id: 'key2',
+        name: 'Test Key',
+        key: 'ia_newrawkey',
+        key_prefix: 'ia_newra',
+        scopes: ['read'],
+        expires_at: null,
+        created_at: new Date(),
+      };
+
+      apiKeyService.rotate.mockResolvedValue(expectedResponse);
+
+      const result = await controller.rotate(mockUser, 'key1', {
+        grace_period_ms: 3600_000,
+      });
+
+      expect(apiKeyService.rotate).toHaveBeenCalledWith(
+        'key1',
+        mockUser.id,
+        3600_000,
+      );
+      expect(result).toEqual(expectedResponse);
+    });
+
+    it('should rotate a key without an explicit grace period', async () => {
+      const mockUser = { id: 'user123' } as User;
+      apiKeyService.rotate.mockResolvedValue({
+        id: 'key2',
+        name: 'Test Key',
+        key: 'ia_newrawkey',
+        key_prefix: 'ia_newra',
+        scopes: ['read'],
+        expires_at: null,
+        created_at: new Date(),
+      });
+
+      await controller.rotate(mockUser, 'key1', {});
+
+      expect(apiKeyService.rotate).toHaveBeenCalledWith(
+        'key1',
+        mockUser.id,
+        undefined,
+      );
     });
   });
 });

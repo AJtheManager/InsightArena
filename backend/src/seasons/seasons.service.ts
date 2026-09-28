@@ -6,16 +6,27 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  Repository,
+  SelectQueryBuilder,
+} from 'typeorm';
 import { NotificationType } from '../notifications/entities/notification.entity';
 import { NotificationsService } from '../notifications/notifications.service';
 import { User } from '../users/entities/user.entity';
 import { Season } from './entities/season.entity';
+import { SeasonLeaderboardSnapshot } from './entities/season-leaderboard-snapshot.entity';
+import {
+  DistributionLedgerStatus,
+  SeasonDistributionLedgerEntry,
+} from './entities/season-distribution-ledger.entity';
 import { CreateSeasonDto } from './dto/create-season.dto';
 import {
   ListSeasonsDto,
   PaginatedSeasonsResponse,
   SeasonListItemDto,
+  SeasonStatus,
   SeasonTopWinnerDto,
 } from './dto/list-seasons.dto';
 import { SorobanService } from '../soroban/soroban.service';
@@ -36,6 +47,8 @@ export class SeasonsService {
   constructor(
     @InjectRepository(Season)
     private readonly seasonsRepository: Repository<Season>,
+    @InjectRepository(SeasonDistributionLedgerEntry)
+    private readonly distributionLedgerRepository: Repository<SeasonDistributionLedgerEntry>,
     private readonly sorobanService: SorobanService,
     private readonly notificationsService: NotificationsService,
     private readonly dataSource: DataSource,
@@ -48,13 +61,18 @@ export class SeasonsService {
     const page = query.page ?? 1;
     const limit = Math.min(query.limit ?? 20, 50);
     const skip = (page - 1) * limit;
+    const now = new Date();
 
     const qb = this.seasonsRepository
       .createQueryBuilder('season')
       .leftJoinAndSelect('season.top_winner', 'winner')
-      .orderBy('season.season_number', 'DESC')
+      .orderBy('season.starts_at', 'DESC')
       .skip(skip)
       .take(limit);
+
+    if (query.status) {
+      this.applyStatusFilter(qb, query.status, now);
+    }
 
     const [rows, total] = await qb.getManyAndCount();
 
@@ -64,6 +82,32 @@ export class SeasonsService {
       page,
       limit,
     };
+  }
+
+  private applyStatusFilter(
+    query: SelectQueryBuilder<Season>,
+    status: SeasonStatus,
+    now: Date,
+  ): SelectQueryBuilder<Season> {
+    switch (status) {
+      case SeasonStatus.Active:
+        return query
+          .andWhere('season.is_active = :isActive', { isActive: true })
+          .andWhere('season.starts_at <= :now', { now })
+          .andWhere('season.ends_at > :now', { now });
+      case SeasonStatus.Upcoming:
+        return query
+          .andWhere('season.starts_at > :now', { now })
+          .andWhere('season.is_finalized = :isFinalized', {
+            isFinalized: false,
+          });
+      case SeasonStatus.Finalized:
+        return query.andWhere('season.is_finalized = :isFinalized', {
+          isFinalized: true,
+        });
+      default:
+        return query;
+    }
   }
 
   private toSeasonListItem(season: Season): SeasonListItemDto {
@@ -299,7 +343,17 @@ export class SeasonsService {
 
   /**
    * Close an ending season and open the next one at the schedule boundary.
-   * Idempotent via `rollover_processed_at` — re-running does not double-finalize.
+   *
+   * Runs as a single DB transaction: freeze the ending season (finalize +
+   * mark rollover_processed_at), snapshot its final leaderboard into the
+   * immutable season_leaderboard_snapshots table, then activate the next
+   * season. A crash or overlapping tick mid-write can never leave standings
+   * finalized without a snapshot, or vice versa — both commit together or
+   * neither does.
+   *
+   * Idempotent via `rollover_processed_at`: re-running for an
+   * already-rolled season is a no-op (checked both before and again inside
+   * the transaction to close the race between two concurrent ticks).
    */
   async processSeasonRollover(now = new Date()): Promise<SeasonRolloverResult> {
     const ending = await this.seasonsRepository
@@ -342,46 +396,89 @@ export class SeasonsService {
       };
     }
 
-    if (!ending.is_finalized) {
-      try {
-        await this.finalizeSeason(ending.id);
-      } catch (err) {
-        // Concurrent rollover may have finalized already; continue if so.
-        if (!(err instanceof ConflictException)) {
-          throw err;
-        }
-      }
-    }
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    const closed = await this.findById(ending.id);
-    if (closed.rollover_processed_at) {
-      return {
-        closedSeasonId: closed.id,
-        openedSeasonId: null,
-        rewardsComputed: false,
-        skipped: true,
-        reason: 'already_processed',
-      };
+    let closed: Season;
+    let opened: Season | null;
+    try {
+      const season = await queryRunner.manager.findOne(Season, {
+        where: { id: ending.id },
+      });
+      if (!season) {
+        throw new NotFoundException(`Season "${ending.id}" not found`);
+      }
+
+      // Re-check inside the transaction: another worker may have committed
+      // a rollover for this season between our lookup above and now.
+      if (season.rollover_processed_at) {
+        await queryRunner.rollbackTransaction();
+        return {
+          closedSeasonId: season.id,
+          openedSeasonId: null,
+          rewardsComputed: false,
+          skipped: true,
+          reason: 'already_processed',
+        };
+      }
+
+      const topWinner = await queryRunner.manager.findOne(User, {
+        where: {},
+        order: { season_points: 'DESC' },
+      });
+
+      season.is_active = false;
+      season.is_finalized = true;
+      season.top_winner = topWinner ?? null;
+      season.rollover_processed_at = now;
+      closed = await queryRunner.manager.save(Season, season);
+
+      await this.snapshotLeaderboard(queryRunner.manager, closed);
+
+      await queryRunner.manager.update(User, {}, { season_points: 0 });
+
+      opened =
+        (await queryRunner.manager.findOne(Season, {
+          where: { season_number: closed.season_number + 1 },
+        })) ?? null;
+
+      if (opened && !opened.is_finalized) {
+        opened.is_active = true;
+        if (opened.starts_at > now) {
+          opened.starts_at = now;
+        }
+        opened = await queryRunner.manager.save(Season, opened);
+      } else {
+        opened = await this.activateDueSeasonWithManager(
+          queryRunner.manager,
+          now,
+        );
+      }
+
+      await queryRunner.commitTransaction();
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      this.logger.error(`Season rollover failed for "${ending.id}"`, err);
+      throw err;
+    } finally {
+      await queryRunner.release();
     }
 
     const rewardsComputed = await this.computeSeasonRewards(closed);
-    closed.rollover_processed_at = now;
-    closed.is_active = false;
-    await this.seasonsRepository.save(closed);
 
-    let opened =
-      (await this.seasonsRepository.findOne({
-        where: { season_number: closed.season_number + 1 },
-      })) ?? null;
-
-    if (opened && !opened.is_finalized) {
-      opened.is_active = true;
-      if (opened.starts_at > now) {
-        opened.starts_at = now;
-      }
-      opened = await this.seasonsRepository.save(opened);
-    } else {
-      opened = await this.activateDueSeason(now);
+    if (closed.top_winner?.stellar_address) {
+      await this.notificationsService.create(
+        closed.top_winner.stellar_address,
+        NotificationType.EventCreated,
+        '🎉 Season Winner!',
+        `Congratulations! You are the winner of the ${closed.name} season with the highest points!`,
+        {
+          season_id: closed.id,
+          season_name: closed.name,
+          winning_points: closed.top_winner.season_points,
+        },
+      );
     }
 
     await this.emitRolloverEvents(closed, opened);
@@ -396,6 +493,47 @@ export class SeasonsService {
       rewardsComputed,
       skipped: false,
     };
+  }
+
+  /**
+   * Snapshot the closed season's final standings into the immutable
+   * season_leaderboard_snapshots table, ordered by season_points desc.
+   * Skips if a snapshot for this season already exists (defends against a
+   * retry racing the unique (season, user) constraint mid-transaction).
+   */
+  private async snapshotLeaderboard(
+    manager: EntityManager,
+    season: Season,
+  ): Promise<void> {
+    const alreadySnapshotted = await manager.exists(SeasonLeaderboardSnapshot, {
+      where: { season: { id: season.id } },
+    });
+    if (alreadySnapshotted) {
+      return;
+    }
+
+    const standings = await manager
+      .createQueryBuilder(User, 'u')
+      .select(['u.id'])
+      .addSelect('u.season_points', 'season_points')
+      .orderBy('u.season_points', 'DESC')
+      .addOrderBy('u.id', 'ASC')
+      .getRawMany<{ u_id: string; season_points: number }>();
+
+    if (standings.length === 0) {
+      return;
+    }
+
+    const snapshots = standings.map((row, index) =>
+      manager.create(SeasonLeaderboardSnapshot, {
+        season,
+        user: { id: row.u_id } as User,
+        rank: index + 1,
+        season_points: Number(row.season_points),
+      }),
+    );
+
+    await manager.save(SeasonLeaderboardSnapshot, snapshots);
   }
 
   private async activateDueSeason(now: Date): Promise<Season | null> {
@@ -416,9 +554,36 @@ export class SeasonsService {
     return this.seasonsRepository.save(due);
   }
 
+  private async activateDueSeasonWithManager(
+    manager: EntityManager,
+    now: Date,
+  ): Promise<Season | null> {
+    const due = await manager
+      .createQueryBuilder(Season, 's')
+      .where('s.is_active = :active', { active: false })
+      .andWhere('s.is_finalized = :fin', { fin: false })
+      .andWhere('s.starts_at <= :now', { now })
+      .andWhere('s.ends_at > :now', { now })
+      .orderBy('s.season_number', 'ASC')
+      .getOne();
+
+    if (!due) {
+      return null;
+    }
+
+    due.is_active = true;
+    return manager.save(Season, due);
+  }
+
   /**
    * Finalize reward computation for a closed season using its reward pool.
    * Standings must already be finalized (top_winner set) before calling.
+   *
+   * Resumable: a ledger row is written PENDING before the payout side effect
+   * and flipped to SUCCEEDED/FAILED after, keyed uniquely per
+   * (season, recipient). Re-running this after a crash finds the existing
+   * row and either skips (already SUCCEEDED) or retries (PENDING/FAILED) —
+   * it never re-creates a duplicate or double-pays.
    */
   async computeSeasonRewards(season: Season): Promise<boolean> {
     const pool = BigInt(season.reward_pool_stroops || '0');
@@ -438,11 +603,40 @@ export class SeasonsService {
         })
       )?.top_winner;
 
-    this.logger.log(
-      `Computed season rewards for ${season.id}: pool=${pool.toString()} winner=${withWinner?.id ?? 'none'}`,
-    );
+    if (!withWinner?.stellar_address) {
+      this.logger.log(
+        `Season ${season.id} has no winner with a stellar address; skipping reward computation`,
+      );
+      return false;
+    }
 
-    if (withWinner?.stellar_address) {
+    let ledgerEntry = await this.distributionLedgerRepository.findOne({
+      where: { season: { id: season.id }, recipient: { id: withWinner.id } },
+    });
+
+    if (ledgerEntry?.status === DistributionLedgerStatus.SUCCEEDED) {
+      this.logger.log(
+        `Season ${season.id} payout to ${withWinner.id} already succeeded; skipping (resumed rollover)`,
+      );
+      return true;
+    }
+
+    if (!ledgerEntry) {
+      ledgerEntry = await this.distributionLedgerRepository.save(
+        this.distributionLedgerRepository.create({
+          season,
+          recipient: withWinner,
+          recipient_stellar_address: withWinner.stellar_address,
+          amount_stroops: pool.toString(),
+          status: DistributionLedgerStatus.PENDING,
+        }),
+      );
+    }
+
+    try {
+      this.logger.log(
+        `Computed season rewards for ${season.id}: pool=${pool.toString()} winner=${withWinner.id}`,
+      );
       await this.notificationsService.create(
         withWinner.stellar_address,
         'season_rewards',
@@ -454,9 +648,83 @@ export class SeasonsService {
           reward_pool_stroops: pool.toString(),
         },
       );
+
+      await this.distributionLedgerRepository.update(ledgerEntry.id, {
+        status: DistributionLedgerStatus.SUCCEEDED,
+      });
+    } catch (err) {
+      await this.distributionLedgerRepository.update(ledgerEntry.id, {
+        status: DistributionLedgerStatus.FAILED,
+        failure_reason: err instanceof Error ? err.message : String(err),
+      });
+      this.logger.error(
+        `Season ${season.id} payout to ${withWinner.id} failed`,
+        err as Error,
+      );
+      throw err;
     }
 
+    await this.reconcileSeasonDistribution(season.id, pool);
     return true;
+  }
+
+  /**
+   * Sums SUCCEEDED ledger rows for a season and compares to its reward
+   * pool, logging a mismatch instead of failing silently.
+   *
+   * Also identifies exactly which ledger rows are still missing a confirmed
+   * (SUCCEEDED) payout - i.e. any PENDING or FAILED row - rather than
+   * re-flagging the whole season as undistributed on a partial failure. A
+   * SUCCEEDED row is never included in `missingRecipients`, so re-running
+   * reconciliation after a retry (via computeSeasonRewards, which is itself
+   * idempotent per recipient) correctly narrows to only what's still owed.
+   * A season whose ledger rows are all SUCCEEDED and whose total matches the
+   * pool reports `matches: true` and an empty `missingRecipients`, i.e. a
+   * no-op requiring no further action.
+   */
+  async reconcileSeasonDistribution(
+    seasonId: string,
+    pool: bigint,
+  ): Promise<{
+    matches: boolean;
+    totalDistributed: string;
+    missingRecipients: SeasonDistributionLedgerEntry[];
+  }> {
+    const allEntries = await this.distributionLedgerRepository.find({
+      where: { season: { id: seasonId } },
+    });
+
+    const succeeded = allEntries.filter(
+      (entry) => entry.status === DistributionLedgerStatus.SUCCEEDED,
+    );
+    const missingRecipients = allEntries.filter(
+      (entry) => entry.status !== DistributionLedgerStatus.SUCCEEDED,
+    );
+
+    const totalDistributed = succeeded.reduce(
+      (sum, entry) => sum + BigInt(entry.amount_stroops),
+      0n,
+    );
+    const matches = totalDistributed === pool;
+    if (!matches) {
+      this.logger.error(
+        `Season ${seasonId} distribution mismatch: distributed=${totalDistributed.toString()} pool=${pool.toString()} missing=${missingRecipients.length}`,
+      );
+    }
+    return {
+      matches,
+      totalDistributed: totalDistributed.toString(),
+      missingRecipients,
+    };
+  }
+
+  async getDistributionLedger(
+    seasonId: string,
+  ): Promise<SeasonDistributionLedgerEntry[]> {
+    return this.distributionLedgerRepository.find({
+      where: { season: { id: seasonId } },
+      order: { created_at: 'ASC' },
+    });
   }
 
   private async emitRolloverEvents(

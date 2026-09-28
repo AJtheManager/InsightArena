@@ -11,8 +11,11 @@ import { Market } from '../../markets/entities/market.entity';
 import { User } from '../../users/entities/user.entity';
 
 export enum DisputeStatus {
-  PENDING = 'pending',
+  OPEN = 'open',
+  REVIEW = 'review',
+  ESCALATED = 'escalated',
   RESOLVED = 'resolved',
+  PENDING = 'pending',
 }
 
 export enum DisputeResolution {
@@ -125,6 +128,36 @@ export class Dispute {
   @Index()
   assignedArbiterId: string | null;
 
+  /**
+   * Escalation tier of this dispute. Tier 1 is the initial round; each
+   * escalation creates a fresh dispute one tier higher, linked back to the
+   * tier it came from via {@link escalatedFrom}. Escalation past the
+   * service's MAX_TIER is rejected.
+   */
+  @Column({ name: 'tier', type: 'int', default: 1 })
+  @Index()
+  tier: number;
+
+  /**
+   * Reputation-weighted participation required before this tier can be
+   * finalized. Votes are weighted by voter reputation; the tier only
+   * resolves once the summed weight of its votes meets this threshold.
+   * Higher tiers carry a higher quorum.
+   */
+  @Column({ name: 'quorum_threshold', type: 'int', default: 0 })
+  quorumThreshold: number;
+
+  @Column({ name: 'escalated_from_id', type: 'uuid', nullable: true })
+  @Index()
+  escalatedFromId: string | null;
+
+  @Column({ name: 'escalated_by_id', type: 'uuid', nullable: true })
+  @Index()
+  escalatedById: string | null;
+
+  @Column({ name: 'escalated_at', type: 'timestamp', nullable: true })
+  escalatedAt: Date | null;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 
@@ -142,6 +175,20 @@ export class Dispute {
   resolvedBy: User | null;
 
   @ManyToOne(() => User, { eager: true, nullable: true })
+  @JoinColumn({ name: 'escalated_by_id', referencedColumnName: 'id' })
+  escalatedBy: User | null;
+
+  @ManyToOne(() => User, { eager: true, nullable: true })
   @JoinColumn({ name: 'assigned_arbiter_id', referencedColumnName: 'id' })
   assignedArbiter: User | null;
+
+  /**
+   * The lower-tier dispute this one was escalated from, if any. A tier-1
+   * dispute has a null reference; every escalation points back to its
+   * immediate predecessor, forming a linear chain used for cross-tier
+   * double-voting checks.
+   */
+  @ManyToOne(() => Dispute, { nullable: true })
+  @JoinColumn({ name: 'escalated_from_id', referencedColumnName: 'id' })
+  escalatedFrom: Dispute | null;
 }

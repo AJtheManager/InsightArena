@@ -37,7 +37,10 @@ export function getCacheWarmingStrategy(
     '',
   );
   const leaderboardSeasonIds = rawSeasons
-    ? rawSeasons.split(',').map((s) => s.trim()).filter(Boolean)
+    ? rawSeasons
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
     : [];
 
   return {

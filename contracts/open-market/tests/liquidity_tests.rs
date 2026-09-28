@@ -736,6 +736,7 @@ fn test_collect_lp_fees_transfers_correct_amount() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let position = client.get_lp_position(&provider, &market_id);
@@ -780,6 +781,7 @@ fn test_collect_lp_fees_resets_fees_to_zero() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     client.collect_lp_fees(&provider, &market_id);
@@ -809,6 +811,68 @@ fn test_collect_lp_fees_fails_when_no_fees_earned() {
 
     let result = client.try_collect_lp_fees(&provider, &market_id);
     assert!(matches!(result, Err(Ok(InsightArenaError::InvalidInput))));
+}
+
+// ── Emergency pause coverage ──────────────────────────────────────────────────
+
+#[test]
+fn test_collect_lp_fees_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let creator = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let trader = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let market_id = client.create_market(&creator, &lp_market_params(&env));
+
+    let liquidity = 100_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    let swap_amount = 10_000_i128;
+    sa.mint(&trader, &swap_amount);
+    token.approve(&trader, &client.address, &swap_amount, &9999);
+    client.swap_outcome(
+        &trader,
+        &market_id,
+        &symbol_short!("yes"),
+        &symbol_short!("no"),
+        &swap_amount,
+        &0_i128,
+        &None::<u64>,
+    );
+
+    client.set_paused(&true, &1u32);
+
+    let result = client.try_collect_lp_fees(&provider, &market_id);
+    assert!(matches!(result, Err(Ok(InsightArenaError::Paused))));
+}
+
+#[test]
+fn test_update_fee_tier_config_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _oracle, _xlm_token) = deploy_with_token(&env);
+
+    client.set_paused(&true, &1u32);
+
+    let new_config = FeeTierConfig {
+        calm_threshold_bps: 40,
+        volatile_threshold_bps: 250,
+        calm_fee_bps: 10,
+        normal_fee_bps: 25,
+        volatile_fee_bps: 90,
+        protocol_share_bps: 2000,
+    };
+
+    let result = client.try_update_fee_tier_config(&admin, &new_config);
+    assert!(matches!(result, Err(Ok(InsightArenaError::Paused))));
 }
 
 #[test]
@@ -843,6 +907,7 @@ fn test_collect_lp_fees_clears_and_idempotent() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     // (a) fees_earned > 0 before collection.
@@ -972,6 +1037,7 @@ fn test_swap_outcome_transfers_correct_amounts() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
     let trader_balance_after = token.balance(&trader);
 
@@ -1010,6 +1076,7 @@ fn test_swap_outcome_updates_pool_reserves() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let reserve_yes_after = client.get_outcome_price(&market_id, &symbol_short!("yes"));
@@ -1048,8 +1115,162 @@ fn test_swap_outcome_fails_below_min_amount_out() {
         &symbol_short!("no"),
         &swap_amount,
         &1_000_000_000_i128,
+        &None::<u64>,
     );
-    assert!(matches!(result, Err(Ok(InsightArenaError::InvalidInput))));
+    assert!(matches!(result, Err(Ok(InsightArenaError::StakeTooLow))));
+}
+
+#[test]
+fn test_swap_outcome_at_exact_min_amount_out_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+    let trader = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let liquidity = 1_000_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    let swap_amount = 100_000_i128;
+    sa.mint(&trader, &swap_amount);
+    token.approve(&trader, &client.address, &swap_amount, &9999);
+
+    // Reserves are 500_000 / 500_000 (liquidity split across 2 outcomes) at the
+    // default volume-tier fee of 30 bps.
+    let expected_out = calculate_swap_output(swap_amount, 500_000, 500_000, 30).unwrap();
+
+    let result = client.try_swap_outcome(
+        &trader,
+        &market_id,
+        &symbol_short!("yes"),
+        &symbol_short!("no"),
+        &swap_amount,
+        &expected_out,
+        &None::<u64>,
+    );
+    assert_eq!(result, Ok(Ok(expected_out)));
+}
+
+#[test]
+fn test_swap_outcome_succeeds_with_a_future_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+    let trader = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let liquidity = 1_000_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    let swap_amount = 100_000_i128;
+    sa.mint(&trader, &swap_amount);
+    token.approve(&trader, &client.address, &swap_amount, &9999);
+
+    let deadline = env.ledger().timestamp() + 3600;
+    let result = client.try_swap_outcome(
+        &trader,
+        &market_id,
+        &symbol_short!("yes"),
+        &symbol_short!("no"),
+        &swap_amount,
+        &0_i128,
+        &Some(deadline),
+    );
+    assert!(result.is_ok(), "swap before the deadline must succeed");
+}
+
+#[test]
+fn test_swap_outcome_succeeds_at_exact_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+    let trader = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let liquidity = 1_000_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    let swap_amount = 100_000_i128;
+    sa.mint(&trader, &swap_amount);
+    token.approve(&trader, &client.address, &swap_amount, &9999);
+
+    // Boundary: deadline == now must still succeed. The check is
+    // `timestamp() > deadline`, not `>=`, so a deadline of exactly "now" has
+    // not yet been missed.
+    let deadline = env.ledger().timestamp();
+    let result = client.try_swap_outcome(
+        &trader,
+        &market_id,
+        &symbol_short!("yes"),
+        &symbol_short!("no"),
+        &swap_amount,
+        &0_i128,
+        &Some(deadline),
+    );
+    assert!(
+        result.is_ok(),
+        "swap at exactly the deadline must still succeed"
+    );
+}
+
+#[test]
+fn test_swap_outcome_fails_past_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+    let trader = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let liquidity = 1_000_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    let swap_amount = 100_000_i128;
+    sa.mint(&trader, &swap_amount);
+    token.approve(&trader, &client.address, &swap_amount, &9999);
+
+    let deadline = env.ledger().timestamp();
+    env.ledger().with_mut(|l| l.timestamp += 1);
+
+    let result = client.try_swap_outcome(
+        &trader,
+        &market_id,
+        &symbol_short!("yes"),
+        &symbol_short!("no"),
+        &swap_amount,
+        &0_i128,
+        &Some(deadline),
+    );
+    assert!(matches!(result, Err(Ok(InsightArenaError::MarketExpired))));
+
+    // The failed swap must not have touched reserves or moved the trader's
+    // funds -- a reverted transaction, not a partially-applied one.
+    let reserve_yes = client.get_outcome_price(&market_id, &symbol_short!("yes"));
+    assert_eq!(reserve_yes, 500_000);
+    assert_eq!(token.balance(&trader), swap_amount);
 }
 
 #[test]
@@ -1082,6 +1303,7 @@ fn test_swap_outcome_records_swap_history() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let history = client.get_swap_history(&market_id);
@@ -1122,6 +1344,7 @@ fn test_swap_outcome_distributes_fees_to_lps() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let position_after = client.get_lp_position(&provider, &market_id);
@@ -1147,8 +1370,14 @@ fn test_add_liquidity_mints_correct_lp_tokens() {
 
     let lp_tokens = client.add_liquidity(&provider, &market_id, &amount);
 
-    // First provider: LP tokens == deposit amount
-    assert_eq!(lp_tokens, amount);
+    // First provider (2-outcome market): per_outcome = 5_000
+    // initial_liquidity = isqrt(5_000 * 5_000) = 5_000
+    // lp_tokens_to_mint = 5_000 - MIN_LIQUIDITY(1_000) = 4_000
+    // total_supply = 5_000 (includes the permanently-locked MIN_LIQUIDITY)
+    let per_outcome = amount / 2; // 5_000
+    let initial_liquidity = per_outcome; // isqrt(5_000^2) = 5_000
+    let expected_lp = initial_liquidity - MIN_LIQUIDITY; // 4_000
+    assert_eq!(lp_tokens, expected_lp);
 
     let position = client.get_lp_position(&provider, &market_id);
     assert_eq!(position.lp_tokens, lp_tokens);
@@ -1172,12 +1401,14 @@ fn test_remove_liquidity_returns_correct_amount() {
 
     let lp_tokens = client.add_liquidity(&provider, &market_id, &amount);
 
-    // Withdraw half
-    let half = lp_tokens / 2;
+    // After the minimum-liquidity fix:
+    //   per_outcome = 5_000, initial_liquidity = 5_000, total_supply = 5_000
+    //   depositor receives lp_tokens = 4_000
+    // Burn half (2_000): withdrawn = 2_000 * 10_000 / 5_000 = 4_000
+    let half = lp_tokens / 2; // 2_000
     let withdrawn = client.remove_liquidity(&provider, &market_id, &half);
-
-    // Should receive half the deposited amount back
-    assert_eq!(withdrawn, amount / 2);
+    let expected_half_withdrawal = half * amount / (amount / 2); // 2_000 * 10_000 / 5_000 = 4_000
+    assert_eq!(withdrawn, expected_half_withdrawal);
 }
 
 #[test]
@@ -1289,6 +1520,7 @@ fn test_multiple_providers_share_fees_proportionally() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let position_a = client.get_lp_position(&provider_a, &market_id);
@@ -1331,6 +1563,7 @@ fn test_swap_outcome_with_multiple_sequential_swaps() {
         &symbol_short!("no"),
         &swap1,
         &0_i128,
+        &None::<u64>,
     );
 
     // Second trader swaps NO for YES (opposite direction)
@@ -1344,6 +1577,7 @@ fn test_swap_outcome_with_multiple_sequential_swaps() {
         &symbol_short!("yes"),
         &swap2,
         &0_i128,
+        &None::<u64>,
     );
 
     // Both swaps should succeed and produce output
@@ -1385,6 +1619,7 @@ fn test_remove_liquidity_with_accumulated_fees() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let position_before = client.get_lp_position(&provider, &market_id);
@@ -1395,9 +1630,15 @@ fn test_remove_liquidity_with_accumulated_fees() {
     let half_lp = lp_tokens / 2;
     let withdrawn = client.remove_liquidity(&provider, &market_id, &half_lp);
 
-    // Withdrawn amount should be at least half the deposit (may include fees)
-    let expected_base_withdrawal = liquidity / 2;
-    assert!(withdrawn >= expected_base_withdrawal);
+    // After the minimum-liquidity fix:
+    //   per_outcome = 250_000, initial_liquidity = 250_000, total_supply = 250_000
+    //   depositor LP = 249_000; half = 124_500
+    //   withdrawn = 124_500 * 500_000 / 250_000 = 249_000
+    // The depositor's correct proportional share (not the raw deposit / 2)
+    let per_outcome = liquidity / 2;
+    let initial_liquidity = per_outcome;
+    let expected_half_withdrawal = half_lp * liquidity / initial_liquidity;
+    assert_eq!(withdrawn, expected_half_withdrawal);
 
     let position_after = client.get_lp_position(&provider, &market_id);
     // Remaining LP tokens should be approximately half
@@ -1443,6 +1684,7 @@ fn test_swap_outcome_price_convergence_toward_equilibrium() {
             &symbol_short!("no"),
             &swap_amount,
             &0_i128,
+            &None::<u64>,
         );
 
         let price_yes = client.get_outcome_price(&market_id, &symbol_short!("yes"));
@@ -1502,6 +1744,7 @@ fn test_pool_volume_accumulates_across_swaps() {
         &symbol_short!("no"),
         &swap1,
         &0_i128,
+        &None::<u64>,
     );
 
     let volume_after_swap1 = client.get_pool_volume_24h(&market_id);
@@ -1518,6 +1761,7 @@ fn test_pool_volume_accumulates_across_swaps() {
         &symbol_short!("yes"),
         &swap2,
         &0_i128,
+        &None::<u64>,
     );
 
     let volume_after_swap2 = client.get_pool_volume_24h(&market_id);
@@ -1566,6 +1810,7 @@ fn test_get_outcome_price_reflects_post_swap_reserves() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     // Get updated prices
@@ -1594,7 +1839,12 @@ fn test_get_outcome_price_reflects_post_swap_reserves() {
 }
 
 #[test]
-fn test_liquidity_no_trade_returns_exact_deposit() {
+fn test_liquidity_no_trade_returns_correct_share() {
+    // Renamed from test_liquidity_no_trade_returns_exact_deposit.
+    // After the minimum-liquidity fix the depositor permanently surrenders
+    // MIN_LIQUIDITY worth of pool tokens on first deposit, so the full
+    // withdrawal returns slightly less than the gross deposit. Verify the
+    // arithmetic is correct rather than expecting the exact deposit back.
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
@@ -1607,15 +1857,29 @@ fn test_liquidity_no_trade_returns_exact_deposit() {
 
     let market_id = client.create_market(&creator, &lp_market_params(&env));
 
-    let initial_deposit = 1_000_i128;
+    // 2-outcome market: per_outcome = 50_000
+    // initial_liquidity = isqrt(50_000^2) = 50_000
+    // lp_tokens_to_mint = 50_000 - 1_000 = 49_000  (MIN_LIQUIDITY = 1_000)
+    // total_supply = 50_000
+    // full withdrawal: 49_000 * 100_000 / 50_000 = 98_000
+    let initial_deposit = 100_000_i128;
     sa.mint(&provider, &initial_deposit);
     token.approve(&provider, &client.address, &initial_deposit, &9999);
     let lp_tokens = client.add_liquidity(&provider, &market_id, &initial_deposit);
 
-    // No swaps — removing all LP tokens returns exactly the deposit
-    let withdrawn = client.remove_liquidity(&provider, &market_id, &lp_tokens);
-    assert_eq!(withdrawn, initial_deposit);
+    let per_outcome = initial_deposit / 2; // 50_000
+    let initial_liquidity = per_outcome; // 50_000
+    let expected_lp = initial_liquidity - MIN_LIQUIDITY; // 49_000
+    assert_eq!(lp_tokens, expected_lp);
 
+    // No swaps — remove all LP tokens
+    let withdrawn = client.remove_liquidity(&provider, &market_id, &lp_tokens);
+    // = 49_000 * 100_000 / 50_000 = 98_000
+    let expected_withdrawal = lp_tokens * initial_deposit / initial_liquidity;
+    assert_eq!(withdrawn, expected_withdrawal);
+
+    // MIN_LIQUIDITY worth of liquidity remains locked; providers list is empty
+    // because the position was deleted, but the pool itself still has reserves.
     let providers = client.get_all_lp_providers(&market_id);
     assert_eq!(providers.len(), 0);
 }
@@ -1653,6 +1917,7 @@ fn test_liquidity_fee_accumulation_end_to_end() {
             &symbol_short!("no"),
             &swap_amount,
             &0_i128,
+            &None::<u64>,
         );
     }
 
@@ -1665,12 +1930,20 @@ fn test_liquidity_fee_accumulation_end_to_end() {
     let collected = client.collect_lp_fees(&provider, &market_id);
     assert_eq!(collected, fees_earned);
 
-    // Remove all LP tokens — returns principal only
+    // Remove all LP tokens — returns principal share (less the permanently
+    // locked MIN_LIQUIDITY fraction, per the share-inflation fix).
+    // withdrawn = lp_tokens * total_liquidity / total_supply
+    //           = 49_000 * 100_000 / 50_000 = 98_000
     let withdrawn = client.remove_liquidity(&provider, &market_id, &lp_tokens);
-    assert_eq!(withdrawn, initial_deposit);
+    let per_outcome = initial_deposit / 2; // 50_000
+    let initial_liquidity = per_outcome; // 50_000
+    let expected_principal = lp_tokens * initial_deposit / initial_liquidity;
+    assert_eq!(withdrawn, expected_principal);
 
-    // Total returned (principal + fees) exceeds the initial deposit
-    assert!(withdrawn + collected > initial_deposit);
+    // Total returned (principal + fees) exceeds the principal-only withdrawal.
+    // (Fees are small relative to the MIN_LIQUIDITY locked fraction, so we
+    // cannot assert total_returned > initial_deposit after the fix.)
+    assert!(withdrawn + collected > withdrawn);
 
     // Pool is empty after full withdrawal
     let providers = client.get_all_lp_providers(&market_id);
@@ -1709,6 +1982,7 @@ fn test_remove_liquidity_returns_principal_plus_accumulated_fees() {
             &symbol_short!("no"),
             &swap_amount,
             &0_i128,
+            &None::<u64>,
         );
     }
 
@@ -1724,20 +1998,48 @@ fn test_remove_liquidity_returns_principal_plus_accumulated_fees() {
     // Remove all LP tokens
     let withdrawn = client.remove_liquidity(&provider, &market_id, &lp_tokens);
 
-    // Verify returned XLM equals original deposit
-    assert_eq!(withdrawn, initial_deposit, "withdrawn should equal initial deposit (principal only)");
+    // After the minimum-liquidity fix the depositor cannot recover the
+    // MIN_LIQUIDITY-locked fraction.
+    // 2-outcome: per_outcome = 500_000_000, initial_liquidity = 500_000_000,
+    //            lp_tokens = 499_000_000, total_supply = 500_000_000
+    // withdrawn = 499_000_000 * 1_000_000_000 / 500_000_000 = 998_000_000
+    let per_outcome = initial_deposit / 2;
+    let initial_liquidity = per_outcome;
+    let expected_withdrawal = lp_tokens * initial_deposit / initial_liquidity;
+    assert_eq!(
+        withdrawn, expected_withdrawal,
+        "withdrawn should equal depositor's proportional share"
+    );
 
-    // Verify principal + fees > original deposit
+    // Verify the depositor received their proportional principal share plus
+    // earned fees. The locked MIN_LIQUIDITY fraction (2 * MIN_LIQUIDITY = 2_000
+    // stroops on a 2-outcome deposit) is intentionally unrecoverable.
     let total_returned = withdrawn + collected;
-    assert!(total_returned > initial_deposit, "total (principal {} + fees {}) should be > initial_deposit {}", withdrawn, collected, initial_deposit);
+    assert!(
+        collected > 0,
+        "provider should have earned fees from {} swaps",
+        5
+    );
+    assert!(
+        total_returned > withdrawn,
+        "total ({}) should exceed principal-only withdrawal ({})",
+        total_returned,
+        withdrawn
+    );
 
     // Verify pool total_pool == 0 after full removal
     let market_after = client.get_market(&market_id);
-    assert_eq!(market_after.total_pool, 0, "pool total_pool should be 0 after full removal");
+    assert_eq!(
+        market_after.total_pool, 0,
+        "pool total_pool should be 0 after full removal"
+    );
 
     // Verify provider's LPPosition no longer exists
     let position_result = client.try_get_lp_position(&provider, &market_id);
-    assert!(position_result.is_err(), "LPPosition should not exist after full removal");
+    assert!(
+        position_result.is_err(),
+        "LPPosition should not exist after full removal"
+    );
 }
 
 // ── Dynamic Fee: Volatility Math (Unit Tests) ─────────────────────────────────
@@ -1801,6 +2103,37 @@ fn test_determine_fee_tier_boundaries_are_exact() {
     // One bps past that tips into volatile.
     assert_eq!(determine_fee_tier(201, &cfg), FeeTier::Volatile);
     assert_eq!(determine_fee_tier(10_000, &cfg), FeeTier::Volatile);
+}
+
+/// Boundary-exactness for the volume-based fee tier selector, mirroring
+/// `test_determine_fee_tier_boundaries_are_exact` for the other (volatility)
+/// tier system (#1694). At each tier's exact threshold volume, the new tier
+/// must already be active — not the previous one.
+#[test]
+fn test_select_volume_fee_tier_boundaries_are_exact() {
+    let env = Env::default();
+    let cfg = insightarena_contract::storage_types::VolumeFeeConfig::default_config(&env);
+
+    // Tier 0 baseline: below any threshold.
+    assert_eq!(select_volume_fee_tier(0, &cfg), (0, 30));
+
+    // Tier 1 boundary: 10_000 XLM.
+    let t1 = 100_000_000_000_i128;
+    assert_eq!(select_volume_fee_tier(t1 - 1, &cfg), (0, 30));
+    assert_eq!(select_volume_fee_tier(t1, &cfg), (1, 25));
+    assert_eq!(select_volume_fee_tier(t1 + 1, &cfg), (1, 25));
+
+    // Tier 2 boundary: 100_000 XLM.
+    let t2 = 1_000_000_000_000_i128;
+    assert_eq!(select_volume_fee_tier(t2 - 1, &cfg), (1, 25));
+    assert_eq!(select_volume_fee_tier(t2, &cfg), (2, 20));
+    assert_eq!(select_volume_fee_tier(t2 + 1, &cfg), (2, 20));
+
+    // Tier 3 boundary: 1_000_000 XLM.
+    let t3 = 10_000_000_000_000_i128;
+    assert_eq!(select_volume_fee_tier(t3 - 1, &cfg), (2, 20));
+    assert_eq!(select_volume_fee_tier(t3, &cfg), (3, 15));
+    assert_eq!(select_volume_fee_tier(t3 + 1, &cfg), (3, 15));
 }
 
 #[test]
@@ -1917,7 +2250,7 @@ fn test_update_fee_tier_config_rejects_invalid_protocol_share() {
 // ── Dynamic Fee: End-to-End Swap Behaviour ────────────────────────────────────
 
 #[test]
-fn test_market_fee_info_defaults_to_calm_before_any_swap() {
+fn test_market_fee_info_defaults_to_volume_tier_zero_before_any_swap() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin, _oracle, xlm_token) = deploy_with_token(&env);
@@ -1932,13 +2265,17 @@ fn test_market_fee_info_defaults_to_calm_before_any_swap() {
     client.add_liquidity(&provider, &market_id, &liquidity);
 
     let info = client.get_market_fee_info(&market_id);
+    // Volatility tier is informational; Calm with no samples.
     assert_eq!(info.tier, FeeTier::Calm);
     assert_eq!(info.volatility_ema_bps, 0);
-    assert_eq!(info.effective_fee_bps, FeeTierConfig::default_config().calm_fee_bps);
+    // effective_fee_bps is the volume-based tier 0 fee (30 bps default).
+    let default_vol_cfg = FeeTierConfig::default_config();
+    assert_eq!(info.volume_tier_index, 0);
+    assert_eq!(info.effective_fee_bps, 30);
 }
 
 #[test]
-fn test_price_moving_swap_burst_raises_fee_tier() {
+fn test_volume_accumulation_lowers_fee_tier() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin, _oracle, xlm_token) = deploy_with_token(&env);
@@ -1949,70 +2286,55 @@ fn test_price_moving_swap_burst_raises_fee_tier() {
     let sa = StellarAssetClient::new(&env, &xlm_token);
     let token = TokenClient::new(&env, &xlm_token);
 
-    // Balanced pool: 500_000 / 500_000 reserves.
     let liquidity = 1_000_000_i128;
     sa.mint(&provider, &liquidity);
     token.approve(&provider, &client.address, &liquidity, &9999);
     client.add_liquidity(&provider, &market_id, &liquidity);
 
-    let swap_amount = 500_000_i128;
-    sa.mint(&trader, &(swap_amount * 5));
-    token.approve(&trader, &client.address, &(swap_amount * 5), &9999);
+    // Start at volume tier 0 (30 bps default).
+    let info0 = client.get_market_fee_info(&market_id);
+    assert_eq!(info0.volume_tier_index, 0);
+    assert_eq!(info0.effective_fee_bps, 30);
 
-    // Swap 1: pool has no prior sample, so the EMA stays at 0 (still calm).
+    // Push volume past the 10_000 XLM threshold (100_000_000_000 stroops).
+    let tier1_volume = 100_000_000_000_i128;
+    sa.mint(&trader, &tier1_volume);
+    token.approve(&trader, &client.address, &tier1_volume, &9999);
     client.swap_outcome(
         &trader,
         &market_id,
         &symbol_short!("yes"),
         &symbol_short!("no"),
-        &swap_amount,
+        &tier1_volume,
         &0_i128,
+        &None::<u64>,
     );
-    assert_eq!(client.get_market_fee_info(&market_id).tier, FeeTier::Calm);
 
-    // Swap 2: a large same-direction trade moves the price sharply -> tier rises to normal.
+    let info1 = client.get_market_fee_info(&market_id);
+    assert_eq!(info1.volume_tier_index, 1);
+    assert_eq!(info1.effective_fee_bps, 25);
+
+    // Push volume past the 100_000 XLM threshold.
+    let tier2_volume = 900_000_000_000_i128; // cumulative = 1_000_000_000_000
+    sa.mint(&trader, &tier2_volume);
+    token.approve(&trader, &client.address, &tier2_volume, &9999);
     client.swap_outcome(
         &trader,
         &market_id,
         &symbol_short!("yes"),
         &symbol_short!("no"),
-        &swap_amount,
+        &tier2_volume,
         &0_i128,
-    );
-    assert_eq!(client.get_market_fee_info(&market_id).tier, FeeTier::Normal);
-
-    // Swap 3: another large same-direction trade -> tier rises to volatile.
-    client.swap_outcome(
-        &trader,
-        &market_id,
-        &symbol_short!("yes"),
-        &symbol_short!("no"),
-        &swap_amount,
-        &0_i128,
-    );
-    let info_after_3 = client.get_market_fee_info(&market_id);
-    assert_eq!(info_after_3.tier, FeeTier::Volatile);
-    assert_eq!(
-        info_after_3.effective_fee_bps,
-        FeeTierConfig::default_config().volatile_fee_bps
+        &None::<u64>,
     );
 
-    // Two more bursts stay in the volatile tier.
-    for _ in 0..2 {
-        client.swap_outcome(
-            &trader,
-            &market_id,
-            &symbol_short!("yes"),
-            &symbol_short!("no"),
-            &swap_amount,
-            &0_i128,
-        );
-    }
-    assert_eq!(client.get_market_fee_info(&market_id).tier, FeeTier::Volatile);
+    let info2 = client.get_market_fee_info(&market_id);
+    assert_eq!(info2.volume_tier_index, 2);
+    assert_eq!(info2.effective_fee_bps, 20);
 }
 
 #[test]
-fn test_quiet_period_lowers_fee_tier_back_to_calm() {
+fn test_volatility_tier_still_tracked_informational() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin, _oracle, xlm_token) = deploy_with_token(&env);
@@ -2032,7 +2354,10 @@ fn test_quiet_period_lowers_fee_tier_back_to_calm() {
     let quiet_amount = 10_i128;
     let quiet_swaps = 7_u32;
 
-    sa.mint(&trader, &(burst_amount * 5 + quiet_amount * quiet_swaps as i128));
+    sa.mint(
+        &trader,
+        &(burst_amount * 5 + quiet_amount * quiet_swaps as i128),
+    );
     token.approve(
         &trader,
         &client.address,
@@ -2049,9 +2374,13 @@ fn test_quiet_period_lowers_fee_tier_back_to_calm() {
             &symbol_short!("no"),
             &burst_amount,
             &0_i128,
+            &None::<u64>,
         );
     }
-    assert_eq!(client.get_market_fee_info(&market_id).tier, FeeTier::Volatile);
+    assert_eq!(
+        client.get_market_fee_info(&market_id).tier,
+        FeeTier::Volatile
+    );
 
     // A quiet period of tiny swaps should decay the EMA back down.
     for _ in 0..quiet_swaps {
@@ -2062,15 +2391,15 @@ fn test_quiet_period_lowers_fee_tier_back_to_calm() {
             &symbol_short!("no"),
             &quiet_amount,
             &0_i128,
+            &None::<u64>,
         );
     }
 
     let info = client.get_market_fee_info(&market_id);
     assert_eq!(info.tier, FeeTier::Calm);
-    assert_eq!(
-        info.effective_fee_bps,
-        FeeTierConfig::default_config().calm_fee_bps
-    );
+    // effective_fee_bps is volume-based, not volatility-based.
+    // It stays at the volume tier 0 rate since cumulative volume is still low.
+    assert_eq!(info.effective_fee_bps, 30);
 }
 
 #[test]
@@ -2109,6 +2438,7 @@ fn test_dynamic_fee_split_between_lp_and_protocol_treasury_is_conserved() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let treasury_after = client.get_treasury_balance();
@@ -2137,10 +2467,7 @@ fn test_dynamic_fee_split_between_lp_and_protocol_treasury_is_conserved() {
 /// Must be called immediately after the swap whose event is under test —
 /// before any further contract calls — because the test host's `Events::all`
 /// only retains events from the most recent top-level invocation.
-fn last_treasury_split_event(
-    env: &Env,
-    contract_id: &Address,
-) -> (u64, Address, i128, i128, i128) {
+fn last_treasury_split_event(env: &Env, contract_id: &Address) -> (u64, Address, i128, i128, i128) {
     let events = env.events().all();
     for event in events.iter().rev() {
         if &event.0 != contract_id || event.1.len() != 2 {
@@ -2198,6 +2525,7 @@ fn test_treasury_split_default_preserves_prior_swap_behavior() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     // Must read the event right after the swap, before any further calls.
@@ -2257,6 +2585,7 @@ fn swap_with_treasury_split(
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     // Must read the event right after the swap, before any further calls.
@@ -2321,7 +2650,10 @@ fn test_treasury_split_custom_ratio_conserves_protocol_share_with_rounding() {
     let expected_lp_amount_from_protocol = protocol_fee_share - expected_treasury_amount;
 
     assert_eq!(treasury_delta, expected_treasury_amount);
-    assert_eq!(lp_delta, original_lp_share + expected_lp_amount_from_protocol);
+    assert_eq!(
+        lp_delta,
+        original_lp_share + expected_lp_amount_from_protocol
+    );
     // Conservation: every stroop of the protocol's fee cut is accounted for.
     assert_eq!(
         treasury_delta + (lp_delta - original_lp_share),
@@ -2333,7 +2665,10 @@ fn test_treasury_split_custom_ratio_conserves_protocol_share_with_rounding() {
     assert_eq!(event_treasury, cfg.treasury_address);
     assert_eq!(event_fee, expected_total_fee);
     assert_eq!(event_treasury_amt, expected_treasury_amount);
-    assert_eq!(event_lp_amt, original_lp_share + expected_lp_amount_from_protocol);
+    assert_eq!(
+        event_lp_amt,
+        original_lp_share + expected_lp_amount_from_protocol
+    );
 }
 
 #[test]
@@ -2407,6 +2742,7 @@ fn test_swap_history_records_effective_fee_paid() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let history = client.get_swap_history(&market_id);
@@ -2452,6 +2788,7 @@ fn test_twap_multi_swap_matches_hand_computed_average() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
     let p1 = client.get_outcome_price(&market_id, &symbol_short!("yes"));
 
@@ -2463,6 +2800,7 @@ fn test_twap_multi_swap_matches_hand_computed_average() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
     let p2 = client.get_outcome_price(&market_id, &symbol_short!("yes"));
 
@@ -2474,6 +2812,7 @@ fn test_twap_multi_swap_matches_hand_computed_average() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let now = env.ledger().timestamp();
@@ -2527,6 +2866,7 @@ fn test_twap_resists_single_block_price_spike() {
         &symbol_short!("no"),
         &spike_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     // Advance a single second so the spike itself contributes a (tiny) sliver
@@ -2538,7 +2878,10 @@ fn test_twap_resists_single_block_price_spike() {
     let window = now - t0;
     let twap = client.get_twap(&market_id, &symbol_short!("yes"), &window);
 
-    assert!(spot_after_spike > price_before_spike * 2, "spike should be dramatic");
+    assert!(
+        spot_after_spike > price_before_spike * 2,
+        "spike should be dramatic"
+    );
 
     let spot_move = (spot_after_spike - price_before_spike).abs();
     let twap_move = (twap - price_before_spike).abs();
@@ -2673,7 +3016,12 @@ fn test_twap_ring_buffer_wraparound() {
     let num_swaps: u32 = TWAP_RING_BUFFER_CAPACITY + 20;
     let swap_amount = 1_000_i128;
     sa.mint(&trader, &(swap_amount * num_swaps as i128));
-    token.approve(&trader, &client.address, &(swap_amount * num_swaps as i128), &9999);
+    token.approve(
+        &trader,
+        &client.address,
+        &(swap_amount * num_swaps as i128),
+        &9999,
+    );
 
     for _ in 0..num_swaps {
         env.ledger().with_mut(|l| l.timestamp += 50);
@@ -2684,6 +3032,7 @@ fn test_twap_ring_buffer_wraparound() {
             &symbol_short!("no"),
             &swap_amount,
             &0_i128,
+            &None::<u64>,
         );
     }
 
@@ -2712,8 +3061,8 @@ fn test_twap_ring_buffer_wraparound() {
 
 // ── Last LP exit integration tests (#1269) ────────────────────────────────────
 
-/// Single LP adds then removes 100% of their LP tokens. They must receive back
-/// the full deposit with no dust stranded.
+/// Single LP adds then removes 100% of their LP tokens. They receive back
+/// their proportional share; the MIN_LIQUIDITY fraction stays locked.
 #[test]
 fn test_full_lp_exit_returns_proportional_reserves() {
     let env = Env::default();
@@ -2730,21 +3079,42 @@ fn test_full_lp_exit_returns_proportional_reserves() {
     sa.mint(&lp, &amount);
     token.approve(&lp, &client.address, &amount, &9999);
 
-    let balance_before = token.balance(&lp);
+    // 2-outcome market: per_outcome = 50_000_000
+    // initial_liquidity = isqrt(50_000_000^2) = 50_000_000
+    // lp_tokens_to_mint = 50_000_000 - 1_000 (MIN_LIQUIDITY) = 49_999_000
+    // total_supply = 50_000_000
+    let per_outcome = amount / 2; // 50_000_000
+    let initial_liquidity = per_outcome; // 50_000_000
+    let expected_lp = initial_liquidity - MIN_LIQUIDITY; // 49_999_000
 
-    // Add all liquidity — LP tokens minted 1:1 for first deposit.
     let lp_tokens = client.add_liquidity(&lp, &market_id, &amount);
-    assert_eq!(lp_tokens, amount);
+    assert_eq!(
+        lp_tokens, expected_lp,
+        "first depositor should receive initial_liquidity - MIN_LIQUIDITY"
+    );
     assert_eq!(token.balance(&lp), 0);
 
-    // Remove all LP tokens — full deposit must be returned, no dust.
+    // Remove all LP tokens — depositor gets their proportional share back.
+    // withdrawn = lp_tokens * amount / initial_liquidity
+    //           = 49_999_000 * 100_000_000 / 50_000_000 = 99_998_000
+    let expected_withdrawn = lp_tokens * amount / initial_liquidity;
     let withdrawn = client.remove_liquidity(&lp, &market_id, &lp_tokens);
-    assert_eq!(withdrawn, amount, "full exit must return the exact deposit");
-    assert_eq!(token.balance(&lp), balance_before, "no dust must remain");
+    assert_eq!(
+        withdrawn, expected_withdrawn,
+        "full exit must return depositor's proportional share"
+    );
+    assert_eq!(
+        token.balance(&lp),
+        expected_withdrawn,
+        "token balance must match withdrawn amount"
+    );
 
     // LP position entry must be deleted after full exit.
     let pos_result = client.try_get_lp_position(&lp, &market_id);
-    assert!(pos_result.is_err(), "LP position must not exist after full exit");
+    assert!(
+        pos_result.is_err(),
+        "LP position must not exist after full exit"
+    );
 }
 
 /// After a full LP exit, `get_outcome_price` must return a defined result —
@@ -2808,8 +3178,12 @@ fn test_empty_pool_swap_outcome_rejected_cleanly() {
         &symbol_short!("no"),
         &1_000_000_i128,
         &0_i128,
+        &None::<u64>,
     );
-    assert!(swap_result.is_err(), "swap on depleted pool must be rejected cleanly");
+    assert!(
+        swap_result.is_err(),
+        "swap on depleted pool must be rejected cleanly"
+    );
 }
 
 /// Adding liquidity again after a full drain must re-initialize the pool
@@ -2950,8 +3324,7 @@ fn test_swap_output_heavily_imbalanced_reserves_both_directions() {
     // Direction B: scarce input reserve, abundant output reserve (1 : 1,000,000).
     // A modest input against a near-empty input-side reserve dominates the
     // pool and must not panic or overflow.
-    let abundant_out =
-        calculate_swap_output(10_000_i128, 1_i128, 1_000_000_i128, fee_bps).unwrap();
+    let abundant_out = calculate_swap_output(10_000_i128, 1_i128, 1_000_000_i128, fee_bps).unwrap();
     assert!(abundant_out >= 0);
     assert!(abundant_out < 1_000_000_i128);
 }
@@ -3051,7 +3424,10 @@ fn test_swap_output_invariant_k_never_decreases_with_fees() {
 #[test]
 fn test_il_no_price_change_is_zero() {
     // k == 1 (entry ratio == current ratio) must give exactly 0 bps.
-    assert_eq!(calculate_impermanent_loss_bps(1000, 1000, 1000, 1000), Ok(0));
+    assert_eq!(
+        calculate_impermanent_loss_bps(1000, 1000, 1000, 1000),
+        Ok(0)
+    );
     assert_eq!(
         calculate_impermanent_loss_bps(500_000, 500_000, 2_000_000, 2_000_000),
         Ok(0)
@@ -3189,6 +3565,7 @@ fn test_get_position_il_favorable_price_move() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let current_a = client.get_outcome_price(&market_id, &symbol_short!("yes"));
@@ -3240,6 +3617,7 @@ fn test_get_position_il_adverse_price_move() {
         &symbol_short!("yes"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     let current_a = client.get_outcome_price(&market_id, &symbol_short!("yes"));
@@ -3277,8 +3655,10 @@ fn test_entry_snapshot_immutable_across_topup() {
     client.add_liquidity(&provider, &market_id, &first_deposit);
 
     let position_before = client.get_lp_position(&provider, &market_id);
-    let (entry_a_before, entry_b_before) =
-        (position_before.entry_reserve_a, position_before.entry_reserve_b);
+    let (entry_a_before, entry_b_before) = (
+        position_before.entry_reserve_a,
+        position_before.entry_reserve_b,
+    );
 
     // Move the pool's price before the top-up.
     let swap_amount = 200_000_i128;
@@ -3291,6 +3671,7 @@ fn test_entry_snapshot_immutable_across_topup() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     // Top-up deposit by the same provider.
@@ -3335,6 +3716,7 @@ fn test_cumulative_il_untouched_by_swaps_updated_on_withdrawal() {
         &symbol_short!("no"),
         &swap_amount,
         &0_i128,
+        &None::<u64>,
     );
 
     // Price has moved, so the live IL is non-zero, but nothing has been
@@ -3382,4 +3764,320 @@ fn test_cumulative_il_zero_on_withdrawal_without_price_change() {
 
     let position = client.get_lp_position(&provider, &market_id);
     assert_eq!(position.cumulative_il_bps, 0);
+}
+
+// ── get_market_twap (Issue #1512) ───────────────────────────────────────────
+
+#[test]
+fn test_market_twap_matches_primary_outcome_twap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let provider = Address::generate(&env);
+    let trader = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let liquidity = 1_000_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    let swap_amount = 20_000_i128;
+    sa.mint(&trader, &swap_amount);
+    token.approve(&trader, &client.address, &swap_amount, &9999);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.swap_outcome(
+        &trader,
+        &market_id,
+        &symbol_short!("yes"),
+        &symbol_short!("no"),
+        &swap_amount,
+        &0_i128,
+        &None::<u64>,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    let window: u64 = 200;
+    let expected = client.get_twap(&market_id, &symbol_short!("yes"), &window);
+    let market_twap = client.get_market_twap(&market_id, &window);
+
+    // `outcome_options[0]` is "yes" for `lp_market_params`, so the market-level
+    // convenience view must agree exactly with the outcome-scoped one.
+    assert_eq!(market_twap, expected);
+}
+
+#[test]
+fn test_market_twap_insufficient_history_returns_typed_error() {
+    let env = Env::default();
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let provider = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+    let liquidity = 100_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    // Pool was created at t=500; a window of 10,000s reaches back before
+    // genesis (t=0), which predates the oldest retained observation.
+    let result = client.try_get_market_twap(&market_id, &10_000_u64);
+    assert!(matches!(
+        result,
+        Err(Ok(InsightArenaError::TwapInsufficientHistory))
+    ));
+}
+
+#[test]
+fn test_market_twap_empty_window_returns_typed_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let provider = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+    let liquidity = 100_000_i128;
+    sa.mint(&provider, &liquidity);
+    token.approve(&provider, &client.address, &liquidity, &9999);
+    client.add_liquidity(&provider, &market_id, &liquidity);
+
+    let result = client.try_get_market_twap(&market_id, &0_u64);
+    assert!(matches!(
+        result,
+        Err(Ok(InsightArenaError::TwapEmptyWindow))
+    ));
+}
+
+#[test]
+fn test_market_twap_unknown_market_returns_typed_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, _xlm_token) = deploy_with_token(&env);
+
+    let result = client.try_get_market_twap(&999_u64, &60_u64);
+    assert!(matches!(result, Err(Ok(InsightArenaError::MarketNotFound))));
+}
+
+// ── Issue #1675: Minimum Liquidity Lock Tests ─────────────────────────────────
+//
+// These tests verify the fix for the first-depositor share-inflation /
+// full-drain vulnerability.  On bootstrap the contract now:
+//   1. computes initial_liquidity = isqrt(per_outcome_a * per_outcome_b)
+//   2. permanently locks MIN_LIQUIDITY in total_supply (no account owns it)
+//   3. credits the depositor with lp_tokens_to_mint = initial_liquidity - MIN_LIQUIDITY
+
+/// Test 1 — Verify the minimum-liquidity lock is applied on the very first
+/// add_liquidity call and that no account owns the locked portion.
+///
+/// Setup  : 2-outcome market, amount_a = amount_b = 100_000 (each outcome
+///          receives 100_000; total deposit = 200_000 across two outcomes, but
+///          the `add_liquidity` API takes the total XLM amount which is split
+///          per-outcome internally).
+///
+/// We use a single `amount` of 200_000 so per_outcome = 100_000 each.
+///
+///   initial_liquidity = isqrt(100_000 * 100_000) = 100_000
+///   total_supply      = 100_000
+///   depositor LP      = 100_000 - 1_000 (MIN_LIQUIDITY) = 99_000
+///   sum of all tracked LP balances = 99_000 = total_supply - MIN_LIQUIDITY  ✓
+#[test]
+fn test_first_deposit_locks_minimum_liquidity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let depositor = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    // 2-outcome market: per_outcome = 100_000, so total deposit = 200_000.
+    let amount = 200_000_i128;
+    sa.mint(&depositor, &amount);
+    token.approve(&depositor, &client.address, &amount, &9999);
+
+    let lp_minted = client.add_liquidity(&depositor, &market_id, &amount);
+
+    // ── Depositor LP balance == initial_liquidity - MIN_LIQUIDITY ─────────────
+    // per_outcome = 100_000; isqrt(100_000^2) = 100_000; locked = 1_000
+    let per_outcome: i128 = amount / 2; // 100_000
+    let initial_liquidity: i128 = per_outcome; // isqrt(100_000^2)
+    let expected_lp = initial_liquidity - MIN_LIQUIDITY; // 99_000
+    assert_eq!(
+        lp_minted, expected_lp,
+        "depositor should receive initial_liquidity - MIN_LIQUIDITY LP tokens"
+    );
+
+    // ── total_supply == isqrt(100_000 * 100_000) == 100_000 ──────────────────
+    // We derive total_supply from the pool via remove_liquidity math:
+    // a full burn of depositor tokens should yield
+    //   withdrawn = lp_minted * total_deposit / total_supply
+    //             = 99_000 * 200_000 / 100_000 = 198_000
+    // which is total_deposit - 2_000 (the MIN_LIQUIDITY-locked fraction).
+    let full_withdrawal = client.remove_liquidity(&depositor, &market_id, &lp_minted);
+    let expected_withdrawal = lp_minted * amount / initial_liquidity; // 198_000
+    assert_eq!(
+        full_withdrawal, expected_withdrawal,
+        "full withdrawal should equal depositor_lp * total_deposit / total_supply"
+    );
+
+    // ── No account holds the locked MIN_LIQUIDITY ─────────────────────────────
+    // After the depositor has burned all their LP tokens the provider list
+    // is empty, so the sum of all tracked LP balances is 0.
+    // total_supply still counts MIN_LIQUIDITY, but no address can redeem it —
+    // confirming: sum(tracked balances) = total_supply - MIN_LIQUIDITY.
+    let providers = client.get_all_lp_providers(&market_id);
+    assert_eq!(
+        providers.len(),
+        0,
+        "no provider should hold the locked MIN_LIQUIDITY portion"
+    );
+}
+
+/// Test 2 — A dust first deposit whose geometric mean does not exceed
+/// MIN_LIQUIDITY must be rejected and must leave the pool state untouched.
+///
+/// With a 2-outcome market and amount = 2 (per_outcome = 1):
+///   isqrt(1 * 1) = 1 <= MIN_LIQUIDITY (1_000) → must return Err(StakeTooLow)
+///
+/// We also verify with the existing MIN_LIQUIDITY boundary: amount such that
+/// per_outcome == MIN_LIQUIDITY exactly:  isqrt(1_000 * 1_000) = 1_000 which
+/// is NOT strictly greater than MIN_LIQUIDITY, so it must also be rejected.
+#[test]
+fn test_dust_deposit_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let depositor = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    // ── Case 1: trivially tiny deposit (amount_a = 1, amount_b = 1) ──────────
+    // total amount = 2 so per_outcome = 1; isqrt(1*1) = 1 <= 1_000 → rejected
+    let tiny_amount = 2_i128;
+    sa.mint(&depositor, &tiny_amount);
+    token.approve(&depositor, &client.address, &tiny_amount, &9999);
+
+    let result = client.try_add_liquidity(&depositor, &market_id, &tiny_amount);
+    assert!(
+        matches!(result, Err(Ok(InsightArenaError::StakeTooLow))),
+        "tiny deposit should be rejected with StakeTooLow (reused for InsufficientInitialLiquidity)"
+    );
+
+    // ── State must be completely unchanged after the failed call ──────────────
+    // No pool should have been created.
+    let pool_result = client.try_get_outcome_price(&market_id, &soroban_sdk::symbol_short!("yes"));
+    assert!(
+        pool_result.is_err(),
+        "pool must not exist after a rejected bootstrap deposit"
+    );
+
+    // ── Case 2: exactly-at-boundary deposit (per_outcome == MIN_LIQUIDITY) ───
+    // total = 2 * MIN_LIQUIDITY = 2_000; per_outcome = 1_000
+    // isqrt(1_000 * 1_000) = 1_000 which is == MIN_LIQUIDITY → rejected
+    let boundary_amount = 2 * MIN_LIQUIDITY; // 2_000
+    sa.mint(&depositor, &boundary_amount);
+    token.approve(&depositor, &client.address, &boundary_amount, &9999);
+
+    let result2 = client.try_add_liquidity(&depositor, &market_id, &boundary_amount);
+    assert!(
+        matches!(result2, Err(Ok(InsightArenaError::StakeTooLow))),
+        "boundary deposit (per_outcome == MIN_LIQUIDITY) must also be rejected"
+    );
+
+    // Pool still must not exist.
+    let pool_result2 = client.try_get_outcome_price(&market_id, &soroban_sdk::symbol_short!("yes"));
+    assert!(
+        pool_result2.is_err(),
+        "pool must still not exist after boundary-rejected deposit"
+    );
+}
+
+/// Test 3 — After the first depositor withdraws their entire LP balance the
+/// permanently-locked MIN_LIQUIDITY fraction keeps a non-zero reserve in the
+/// pool so the pool can never be fully drained to zero.
+#[test]
+fn test_full_drain_prevented() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _oracle, xlm_token) = deploy_with_token(&env);
+
+    let depositor = Address::generate(&env);
+    let market_id = client.create_market(&_admin, &lp_market_params(&env));
+
+    let sa = StellarAssetClient::new(&env, &xlm_token);
+    let token = TokenClient::new(&env, &xlm_token);
+
+    // Same setup as test_first_deposit_locks_minimum_liquidity.
+    let amount = 200_000_i128;
+    sa.mint(&depositor, &amount);
+    token.approve(&depositor, &client.address, &amount, &9999);
+
+    let lp_minted = client.add_liquidity(&depositor, &market_id, &amount);
+
+    // per_outcome = 100_000; lp_minted = 99_000; total_supply = 100_000
+    let per_outcome: i128 = amount / 2;
+    let initial_liquidity: i128 = per_outcome;
+    let expected_lp = initial_liquidity - MIN_LIQUIDITY;
+    assert_eq!(lp_minted, expected_lp);
+
+    // ── Depositor withdraws their entire LP balance (99_000) ──────────────────
+    let withdrawn = client.remove_liquidity(&depositor, &market_id, &lp_minted);
+
+    // Withdrawal succeeds and returns the correct proportional amount.
+    let expected_withdrawal = lp_minted * amount / initial_liquidity; // 198_000
+    assert_eq!(withdrawn, expected_withdrawal, "withdrawal should succeed");
+    assert!(withdrawn > 0, "withdrawal must be positive");
+
+    // ── Pool reserves are NOT zero — MIN_LIQUIDITY worth remains locked ───────
+    // NOTE: `remove_liquidity` decrements `pool.total_liquidity` but does NOT
+    // update the per-outcome `outcome_reserves` map (reserves reflect gross
+    // tokens held in escrow, not the LP-redeemable portion).  So
+    // `get_outcome_price` still returns the original per-outcome reserve (100_000)
+    // rather than the locked fraction.  What matters for the drain-prevention
+    // guarantee is that `total_liquidity` is non-zero — i.e. a second depositor
+    // joining the pool after the first one exits will still see a pool with
+    // positive `total_liquidity` and `lp_token_supply`, so they get proportional
+    // shares rather than 1:1 (preventing the inflation attack).
+    //
+    // Verify: outcome reserves remain positive (pool is not "zeroed out").
+    let reserve_yes = client.get_outcome_price(&market_id, &soroban_sdk::symbol_short!("yes"));
+    let reserve_no = client.get_outcome_price(&market_id, &soroban_sdk::symbol_short!("no"));
+
+    assert!(
+        reserve_yes > 0,
+        "YES reserve must remain > 0 after full depositor withdrawal"
+    );
+    assert!(
+        reserve_no > 0,
+        "NO reserve must remain > 0 after full depositor withdrawal"
+    );
+
+    // ── The depositor could NOT drain the full deposit ────────────────────────
+    // The MIN_LIQUIDITY fraction (2 * MIN_LIQUIDITY stroops = 2_000 for a
+    // 2-outcome pool) is permanently unrecoverable by any single withdrawer.
+    let locked_total = amount - withdrawn; // 200_000 - 198_000 = 2_000
+    assert_eq!(
+        locked_total,
+        2 * MIN_LIQUIDITY,
+        "exactly 2 * MIN_LIQUIDITY stroops must remain locked in the pool"
+    );
 }

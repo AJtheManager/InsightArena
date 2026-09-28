@@ -27,22 +27,54 @@ export interface EventWinnerPayload {
   total_matches: number;
 }
 
+export interface AchievementUnlockedPayload {
+  achievement_id: string;
+  type: string;
+  title: string;
+  description: string;
+  icon_url: string;
+  reward_points: number;
+  unlocked_at: Date;
+}
+
+export interface AchievementProgressPayload {
+  achievement_id: string;
+  type: string;
+  current_progress: number;
+  threshold: number;
+  progress_percentage: number;
+}
+
+interface DeliveryConfirmationEntry {
+  notificationIds: Set<number>;
+  confirmedAt: number;
+}
+
 @Injectable()
 export class NotificationBroadcasterService implements OnModuleDestroy {
   private readonly logger = new Logger(NotificationBroadcasterService.name);
   private readonly batchQueue = new Map<string, NotificationPayload[]>();
   private readonly batchInterval = 1000; // 1 second
   private readonly maxBatchSize = 10;
-  private deliveryConfirmations = new Map<string, Set<number>>();
+  private readonly confirmationTtlMs = 5 * 60 * 1000; // 5 minutes
+  private readonly confirmationCleanupIntervalMs = 60 * 1000; // 1 minute
+  private deliveryConfirmations = new Map<string, DeliveryConfirmationEntry>();
   private batchProcessorInterval?: NodeJS.Timeout;
+  private confirmationCleanupInterval?: NodeJS.Timeout;
 
   constructor(private readonly gateway: EventsGateway) {
     this.startBatchProcessor();
+    this.startConfirmationCleanup();
   }
 
   onModuleDestroy(): void {
     if (this.batchProcessorInterval) {
       clearInterval(this.batchProcessorInterval);
+      this.batchProcessorInterval = undefined;
+    }
+    if (this.confirmationCleanupInterval) {
+      clearInterval(this.confirmationCleanupInterval);
+      this.confirmationCleanupInterval = undefined;
     }
   }
 
@@ -121,6 +153,60 @@ export class NotificationBroadcasterService implements OnModuleDestroy {
   }
 
   /**
+   * Notify user that an achievement was unlocked
+   */
+  broadcastAchievementUnlocked(
+    userAddress: string,
+    achievement: AchievementUnlockedPayload,
+  ): void {
+    const payload = {
+      event: 'achievement:unlocked',
+      data: {
+        achievement_id: achievement.achievement_id,
+        type: achievement.type,
+        title: achievement.title,
+        description: achievement.description,
+        icon_url: achievement.icon_url,
+        reward_points: achievement.reward_points,
+        unlocked_at: achievement.unlocked_at,
+        timestamp: new Date(),
+      },
+    };
+    this.gateway.server
+      .to(`user:${userAddress}`)
+      .emit('achievement:unlocked', payload);
+    this.logger.log(
+      `Broadcast achievement:unlocked → user:${userAddress} (achievement=${achievement.achievement_id})`,
+    );
+  }
+
+  /**
+   * Notify user of updated progress toward a locked achievement
+   */
+  broadcastAchievementProgress(
+    userAddress: string,
+    progress: AchievementProgressPayload,
+  ): void {
+    const payload = {
+      event: 'achievement:progress',
+      data: {
+        achievement_id: progress.achievement_id,
+        type: progress.type,
+        current_progress: progress.current_progress,
+        threshold: progress.threshold,
+        progress_percentage: progress.progress_percentage,
+        timestamp: new Date(),
+      },
+    };
+    this.gateway.server
+      .to(`user:${userAddress}`)
+      .emit('achievement:progress', payload);
+    this.logger.log(
+      `Broadcast achievement:progress → user:${userAddress} (achievement=${progress.achievement_id}, pct=${progress.progress_percentage})`,
+    );
+  }
+
+  /**
    * Request delivery confirmation from client
    */
   requestDeliveryConfirmation(
@@ -136,10 +222,16 @@ export class NotificationBroadcasterService implements OnModuleDestroy {
    * Record delivery confirmation
    */
   confirmDelivery(userAddress: string, notificationId: number): void {
-    if (!this.deliveryConfirmations.has(userAddress)) {
-      this.deliveryConfirmations.set(userAddress, new Set());
+    const existing = this.deliveryConfirmations.get(userAddress);
+    if (existing) {
+      existing.notificationIds.add(notificationId);
+      existing.confirmedAt = Date.now();
+    } else {
+      this.deliveryConfirmations.set(userAddress, {
+        notificationIds: new Set([notificationId]),
+        confirmedAt: Date.now(),
+      });
     }
-    this.deliveryConfirmations.get(userAddress)!.add(notificationId);
     this.logger.debug(
       `Delivery confirmed: user=${userAddress}, notification=${notificationId}`,
     );
@@ -150,8 +242,25 @@ export class NotificationBroadcasterService implements OnModuleDestroy {
    */
   isDelivered(userAddress: string, notificationId: number): boolean {
     return (
-      this.deliveryConfirmations.get(userAddress)?.has(notificationId) ?? false
+      this.deliveryConfirmations
+        .get(userAddress)
+        ?.notificationIds.has(notificationId) ?? false
     );
+  }
+
+  /**
+   * Purge delivery confirmation entries that have exceeded the configured age.
+   * Recently-confirmed, still-pending entries are left untouched.
+   */
+  cleanupConfirmations(now: number = Date.now()): void {
+    for (const [userAddress, entry] of this.deliveryConfirmations) {
+      if (now - entry.confirmedAt >= this.confirmationTtlMs) {
+        this.deliveryConfirmations.delete(userAddress);
+        this.logger.debug(
+          `Purged expired delivery confirmations for user=${userAddress}`,
+        );
+      }
+    }
   }
 
   /**
@@ -218,13 +327,11 @@ export class NotificationBroadcasterService implements OnModuleDestroy {
   }
 
   /**
-   * Clean up old confirmations (call periodically)
+   * Periodically purge expired delivery confirmations
    */
-  cleanupConfirmations(): void {
-    // Simple cleanup - in production, track timestamps
-    if (this.deliveryConfirmations.size > 10000) {
-      this.deliveryConfirmations.clear();
-      this.logger.log('Cleared delivery confirmations cache');
-    }
+  private startConfirmationCleanup(): void {
+    this.confirmationCleanupInterval = setInterval(() => {
+      this.cleanupConfirmations();
+    }, this.confirmationCleanupIntervalMs);
   }
 }

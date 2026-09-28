@@ -30,6 +30,7 @@ export interface PredictionSlipContextValue {
   addItem: (item: Omit<SlipItem, "amount">) => void;
   removeItem: (marketId: string) => void;
   updateAmount: (marketId: string, amount: number) => void;
+  restoreItem: (item: SlipItem) => void;
   clearSlip: () => void;
 }
 
@@ -45,6 +46,7 @@ const DEFAULT_CONTEXT_VALUE: PredictionSlipContextValue = {
   addItem: () => {},
   removeItem: () => {},
   updateAmount: () => {},
+  restoreItem: () => {},
   clearSlip: () => {},
 };
 
@@ -57,7 +59,7 @@ const STORAGE_KEY = "insightarena.prediction_slip";
 function readStoredSlip(): SlipItem[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.sessionStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -69,7 +71,7 @@ function readStoredSlip(): SlipItem[] {
 function writeStoredSlip(items: SlipItem[]) {
   if (typeof window === "undefined") return;
   try {
-    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
   } catch {
   }
 }
@@ -124,6 +126,14 @@ export function PredictionSlipProvider({
     );
   }, []);
 
+  const restoreItem = useCallback((item: SlipItem) => {
+    setItems((prev) => {
+      const withoutStaleCopy = prev.filter((candidate) => candidate.marketId !== item.marketId);
+      return [...withoutStaleCopy, { ...item }];
+    });
+    setIsOpen(true);
+  }, []);
+
   const clearSlip = useCallback(() => {
     setItems([]);
   }, []);
@@ -155,6 +165,7 @@ export function PredictionSlipProvider({
       addItem,
       removeItem,
       updateAmount,
+      restoreItem,
       clearSlip,
     }),
     [
@@ -168,6 +179,7 @@ export function PredictionSlipProvider({
       addItem,
       removeItem,
       updateAmount,
+      restoreItem,
       clearSlip,
     ],
   );

@@ -6,9 +6,7 @@ import {
   TableForeignKey,
 } from 'typeorm';
 
-export class CreatePredictionFraudFlags1777500000000
-  implements MigrationInterface
-{
+export class CreatePredictionFraudFlags1777500000000 implements MigrationInterface {
   public async up(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.createTable(
       new Table({
